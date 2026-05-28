@@ -1,0 +1,21 @@
+#!/bin/busybox sh
+
+# 1. BusyBoxの各コマンド（ls, mount, insmodなど）のシンボリックリンクを自動生成
+/bin/busybox --install -s
+
+# 2. Linuxに必須の仮想ファイルシステムをマウント
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+
+# 3. ホスト（CachyOS）のディレクトリを自動マウント (systemdの干渉なしで一発成功します)
+echo "Mounting host share..."
+mount -t 9p -o trans=virtio host /mnt/host
+
+echo "---------------------------------------"
+echo "  Welcome to Minimal BusyBox initramfs!  "
+echo "---------------------------------------"
+
+# 4. 対話型のシェルを起動（これが終了するとカーネルもパニックして止まります）
+export PS1="mouse@BusyBox:\w# "
+exec /bin/sh

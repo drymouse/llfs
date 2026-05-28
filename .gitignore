@@ -1,0 +1,11 @@
+*.img
+*.cpio
+busybox
+linux-*
+
+*.mod
+*.mod.*
+*.o
+*.cmd
+*.symvers
+*.order
