@@ -1,6 +1,6 @@
 set -x
 
-APPEND="root=/dev/sda rw console=ttyS0 oops=panic panic=-1"
+APPEND="root=/dev/sda rw console=ttyS0 oops=panic panic=-1 nokaslr"
 PROJECT_ROOT="./modules"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -13,6 +13,7 @@ QEMU_ARGS=(
   # -drive file=rootfs.img,format=raw,index=1,media=disk 
   -initrd initramfs.cpio
   -nographic 
+  -no-reboot
   -net user,hostfwd=tcp::2222-:22 
   -net nic 
   -append "$APPEND"
