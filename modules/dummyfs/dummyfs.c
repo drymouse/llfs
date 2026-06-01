@@ -11,46 +11,10 @@ static int init_fs_module(void);
 static void cleanup_fs_module(void);
 static void dummyfs_kill(struct super_block *sb);
 static int dummyfs_get_tree(struct fs_context *fc);
-static bool dummyfs_trylock(const struct dentry *dent);
 
 static struct fs_context_operations fc_ope = {
     .get_tree = dummyfs_get_tree,
 };
-
-static const struct super_operations dummyfs_sop = {};
-
-static const struct inode_operations dummyfs_iop = {};
-
-static const struct file_operations dummyfs_fop = {};
-
-static const struct dentry_operations dummyfs_dop = {
-    .d_unalias_trylock = dummyfs_trylock,
-};
-
-static struct super_block dummyfs_sb = {
-    .s_op = &dummyfs_sop,
-};
-
-static struct inode root_inode = {
-    .i_ino = 1,
-    .i_op = &dummyfs_iop,
-    .i_fop = &dummyfs_fop,
-};
-
-static struct dentry root_dent = {
-    .d_parent = &root_dent,
-    .d_name = {
-        .name = "/",
-    },
-    .d_op = &dummyfs_dop,
-    .d_sb = &dummyfs_sb,
-    .d_inode = &root_inode,
-}; 
-
-static bool dummyfs_trylock(const struct dentry *dent) {
-    pr_info(KERN_INFO "trylock\n");
-    return 1;
-}
 
 static int dummyfs_init(struct fs_context *fc) {
     pr_info("Dummy FS is mounted!\n");
@@ -67,7 +31,29 @@ static void dummyfs_kill(struct super_block *sb) {
 }
 
 static int dummyfs_fill_super(struct super_block *sb, struct fs_context *fc) {
-    sb->s_root = &root_dent;
+    struct inode *root_inode;
+    struct dentry *root_dentry;
+
+    sb->s_magic = 0xABCDEF;
+
+    root_inode = new_inode(sb);
+    if (!root_inode) {
+        return -ENOMEM;
+    }
+
+    root_inode->i_ino = 1;
+    root_inode->i_mode = S_IFDIR | 0755;
+    // root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime = current_time(root_inode);
+
+    root_inode->i_op = &simple_dir_inode_operations;
+    root_inode->i_fop = &simple_dir_operations;
+
+    root_dentry = d_make_root(root_inode);
+    if (!root_dentry) {
+        return -ENOMEM;
+    }
+
+    sb->s_root = root_dentry;
 
     return 0;
 }
@@ -75,12 +61,6 @@ static int dummyfs_fill_super(struct super_block *sb, struct fs_context *fc) {
 static int dummyfs_get_tree(struct fs_context *fc) {
     pr_info(KERN_INFO "get_tree\n");
 
-    // struct inode *root_inode = kzalloc(sizeof(struct inode), GFP_KERNEL);
-
-    
-    // while (1) {
-    //     __asm__ volatile("hlt");
-    // }
     return get_tree_nodev(fc, dummyfs_fill_super);
 }
 

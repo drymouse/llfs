@@ -6,8 +6,9 @@ class LoadSymbol(gdb.Command):
 
     def invoke(self, arg, from_tty):
         gdb.execute("b panic")
-        gdb.execute("b *0xffffffffc0000000+0xf0")
-        gdb.execute("add-symbol-file ../../fs-test/modules/dummyfs/dummyfs.ko")
+        gdb.execute("add-symbol-file ../../fs-test/modules/dummyfs/dummyfs.ko 0xffffffffc0000000")
+        gdb.execute("b dummyfs_get_tree")
+        gdb.execute("b vfs_get_tree")
         
 
 LoadSymbol()
