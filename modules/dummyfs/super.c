@@ -3,14 +3,13 @@
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 
-static int dummyfs_init(struct fs_context *fc);
-static int init_fs_module(void);
-static void cleanup_fs_module(void);
-static void dummyfs_kill(struct super_block *sb);
 static int dummyfs_get_tree(struct fs_context *fc);
+extern struct inode_operations dummyfs_dir_iop;
+extern struct file_operations dummyfs_file_fop;
 
 static struct fs_context_operations fc_ope = {
     .get_tree = dummyfs_get_tree,
@@ -30,6 +29,8 @@ static void dummyfs_kill(struct super_block *sb) {
     return;
 }
 
+int ino_top = 1;
+
 static int dummyfs_fill_super(struct super_block *sb, struct fs_context *fc) {
     struct inode *root_inode;
     struct dentry *root_dentry;
@@ -42,10 +43,12 @@ static int dummyfs_fill_super(struct super_block *sb, struct fs_context *fc) {
     }
 
     root_inode->i_ino = 1;
+    ino_top++;
     root_inode->i_mode = S_IFDIR | 0755;
     // root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime = current_time(root_inode);
 
-    root_inode->i_op = &simple_dir_inode_operations;
+    // root_inode->i_op = &simple_dir_inode_operations;
+    root_inode->i_op = &dummyfs_dir_iop;
     root_inode->i_fop = &simple_dir_operations;
 
     root_dentry = d_make_root(root_inode);

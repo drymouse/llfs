@@ -1,5 +1,5 @@
-obj-m = dummyfs.o
-
+obj-m += dummyfs.o
+dummyfs-y += super.o inode.o dentry.o
 # make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 
 all:

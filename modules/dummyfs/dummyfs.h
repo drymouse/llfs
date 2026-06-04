@@ -5,10 +5,10 @@
 #define NULL ((unsigned long)0)
 #endif
 
-// int dummyfs_init(struct fs_context *fc);
-// int init_fs_module(void);
-// void cleanup_fs_module(void);
-// void dummyfs_kill(struct super_block *sb);
+#ifndef __DUMMYFS
+#define __DUMMYFS
 
-// int dummyfs_get_tree(struct fs_context *fc);
-// bool dummy_trylock(const struct dentry *dent);
+int dummyfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl);
+struct dentry *dummyfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+
+#endif
