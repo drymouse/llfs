@@ -29,8 +29,6 @@ static void dummyfs_kill(struct super_block *sb) {
     return;
 }
 
-int ino_top = 1;
-
 static int dummyfs_fill_super(struct super_block *sb, struct fs_context *fc) {
     struct inode *root_inode;
     struct dentry *root_dentry;
@@ -42,8 +40,7 @@ static int dummyfs_fill_super(struct super_block *sb, struct fs_context *fc) {
         return -ENOMEM;
     }
 
-    root_inode->i_ino = 1;
-    ino_top++;
+    root_inode->i_ino = get_next_ino();
     root_inode->i_mode = S_IFDIR | 0755;
     // root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime = current_time(root_inode);
 
