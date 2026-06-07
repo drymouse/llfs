@@ -11,6 +11,7 @@
 static int llfs_get_tree(struct fs_context *fc);
 extern struct inode_operations llfs_dir_iop;
 extern struct file_operations llfs_file_fop;
+extern const struct super_operations llfs_sop;
 
 static struct fs_context_operations fc_ope = {
     .get_tree = llfs_get_tree,
@@ -29,50 +30,63 @@ static int llfs_init(struct fs_context *fc) {
 static void llfs_kill(struct super_block *sb) {
     pr_info("LLFS is unmounted!\n");
 
-    return;
+    kfree(sb->s_fs_info);
+    sb->s_fs_info = NULL;
+
+    kill_block_super(sb);
 }
 
 static int llfs_fill_super(struct super_block *sb, struct fs_context *fc) {
     struct inode *root_inode;
     struct dentry *root_dentry;
-
-    sb_set_blocksize(sb, 4096);
-
     struct buffer_head *bh;
-    bh = sb_bread(sb, LLFS_ROOT_INODE);
+    struct llfs_super_block *dsb;
+    struct llfs_sb_info *sbi;
+
+    sb_set_blocksize(sb, LLFS_BLOCK_SIZE);
+
+    bh = sb_bread(sb, LLFS_SB_BLOCK);
     if (!bh) {
         pr_info(KERN_INFO "sb_bread failed\n");
         return -ENODEV;
     }
 
-    struct llfs_super_block *sb_inner = (struct llfs_super_block *)bh->b_data;
-    struct llfs_super_block *sbi;
+    /* オンディスクのスーパーブロックを、インメモリの sb_info へ
+     * 1度だけエンディアン変換して取り込む。以降は CPU ネイティブ型で扱う。 */
+    dsb = (struct llfs_super_block *)bh->b_data;
 
-    if (sb_inner->block_size != 4096) {
-        sb_set_blocksize(sb, sb_inner->block_size);
-    }
-    
     sbi = kzalloc_obj(*sbi);
-    memcpy(sbi, sb_inner, sizeof(*sbi));
-
-    sb->s_magic = (unsigned)sb_inner->magic;
-    sb->s_fs_info = sbi;
-
-    pr_info(KERN_INFO "magic: 0x%08lx\n", sb->s_magic);
-
-    root_inode = new_inode(sb);
-    if (!root_inode) {
+    if (!sbi) {
+        brelse(bh);
         return -ENOMEM;
     }
 
-    root_inode->i_ino = LLFS_ROOT_INODE;
-    root_inode->i_mode = S_IFDIR | 0755;
-    root_inode->i_mapping->a_ops = &llfs_asops;
-    // root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime = current_time(root_inode);
+    sbi->magic              = le32_to_cpu(dsb->magic);
+    sbi->block_size         = le32_to_cpu(dsb->block_size);
+    sbi->itable_block       = le32_to_cpu(dsb->itable_block);
+    sbi->inode_bitmap_block = le32_to_cpu(dsb->inode_bitmap_block);
+    sbi->block_bitmap_block = le32_to_cpu(dsb->block_bitmap_block);
+    sbi->inode_size         = le16_to_cpu(dsb->inode_size);
 
-    // root_inode->i_op = &simple_dir_inode_operations;
-    root_inode->i_op = &llfs_dir_iop;
-    root_inode->i_fop = &simple_dir_operations;
+    sb->s_fs_info = sbi;
+    sb->s_magic   = sbi->magic;
+    sb->s_op      = &llfs_sop;
+
+    /* 取り込みが済んだら、オンディスクバッファはもう不要 */
+    brelse(bh);
+
+    pr_info(KERN_INFO "magic: 0x%08lx\n", sb->s_magic);
+
+    if (sbi->block_size != LLFS_BLOCK_SIZE) {
+        pr_info(KERN_INFO "unexpected block_size: %u\n", sbi->block_size);
+        return -EINVAL;
+    }
+
+    /* ルート inode は inode テーブルから読む(i_op/i_fop/a_ops/i_private は iget が設定) */
+    root_inode = llfs_iget(sb, LLFS_ROOT_INODE);
+    if (IS_ERR(root_inode)) {
+        return PTR_ERR(root_inode);
+    }
 
     root_dentry = d_make_root(root_inode);
     if (!root_dentry) {
@@ -80,8 +94,6 @@ static int llfs_fill_super(struct super_block *sb, struct fs_context *fc) {
     }
 
     sb->s_root = root_dentry;
-
-    brelse(bh);
 
     return 0;
 }

@@ -2,6 +2,8 @@
 #include <linux/buffer_head.h>
 #include <linux/fs.h>
 #include <linux/iomap.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
 #include <linux/stat.h>
 
 static unsigned int llfs_get_first_free_inode(struct super_block *sb) {
@@ -14,7 +16,8 @@ static unsigned int llfs_get_first_free_inode(struct super_block *sb) {
 
     long unsigned int *bitmap = (long unsigned int *)bh->b_data;
 
-    unsigned int res = find_first_zero_bit(bitmap, sbi->block_size);
+    /* find_first_zero_bit の第2引数はビット数。block_size はバイト数なので 8 倍する */
+    unsigned int res = find_first_zero_bit(bitmap, sbi->block_size * 8);
     set_bit(res, bitmap);
     mark_buffer_dirty(bh);
 
@@ -23,36 +26,47 @@ static unsigned int llfs_get_first_free_inode(struct super_block *sb) {
     return res;
 }
 
+/* inode テーブルからオンディスク inode を読み、ネイティブ型へ変換して inodei に格納 */
 static int llfs_fill_inode_info(struct inode *inode, struct llfs_inode_info *inodei) {
     struct llfs_sb_info *sbi = llfs_get_sb_info(inode->i_sb);
     struct buffer_head *bh = sb_bread(inode->i_sb, sbi->itable_block);
+    struct llfs_inode *raw;
+    int i;
+
     if (!bh) {
         return -1;
     }
-    
-    struct llfs_itable *itable = (struct llfs_itable *)bh->b_data;
 
-    inodei->blocks = itable->table[inode->i_ino].blocks;
-    memcpy(inodei->block, itable->table[inode->i_ino].block, sizeof(*inodei->block));
+    raw = (struct llfs_inode *)(bh->b_data + inode->i_ino * sbi->inode_size);
+
+    inodei->blocks = le32_to_cpu(raw->blocks);
+    for (i = 0; i < LLFS_N_BLOCKS; i++) {
+        inodei->block[i] = le32_to_cpu(raw->block[i]);
+    }
 
     brelse(bh);
 
     return 0;
 }
 
-static int llfs_get_block(struct inode *inode, unsigned int sector, struct buffer_head **bh) {
+static int __maybe_unused llfs_get_block(struct inode *inode, unsigned int sector,
+                                          struct buffer_head **bh) {
     struct llfs_inode_info *inodei = llfs_get_inode_info(inode);
-
-    if (!inodei) {
-        pr_info(KERN_INFO "Let's make inode_info!\n");
-        inodei = kzalloc_obj(*inodei);
-        if (!llfs_fill_inode_info(inode, inodei)) {
-            return -1;
-        }
-    }
 
     if (sector >= LLFS_N_BLOCKS) {
         return -1;
+    }
+
+    if (!inodei) {
+        inodei = kzalloc_obj(*inodei);
+        if (!inodei) {
+            return -1;
+        }
+        if (llfs_fill_inode_info(inode, inodei) < 0) {
+            kfree(inodei);
+            return -1;
+        }
+        inode->i_private = inodei;
     }
 
     *bh = sb_bread(inode->i_sb, inodei->block[sector]);
@@ -64,11 +78,18 @@ static int llfs_get_block(struct inode *inode, unsigned int sector, struct buffe
     return 0;
 }
 
-static struct inode *llfs_fill_inode(struct super_block *sb, unsigned int ino);
 static ssize_t llfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
+
+static void llfs_evict_inode(struct inode *inode) {
+    truncate_inode_pages_final(&inode->i_data);
+    clear_inode(inode);
+    kfree(inode->i_private);
+    inode->i_private = NULL;
+}
 
 const struct super_operations llfs_sop = {
     .statfs = simple_statfs,
+    .evict_inode = llfs_evict_inode,
 };
 
 const struct inode_operations llfs_dir_iop = {
@@ -137,53 +158,111 @@ int llfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentr
     return 0;
 }
 
-struct dentry *llfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
-    pr_info(KERN_INFO "looking up...\n");
-
+/* inode テーブルからオンディスク inode を読み、VFS inode を構築して返す。
+ * iget_locked で inode キャッシュを使い、同一 ino の重複生成を防ぐ。 */
+struct inode *llfs_iget(struct super_block *sb, unsigned long ino) {
+    struct llfs_sb_info *sbi = llfs_get_sb_info(sb);
     struct buffer_head *bh;
+    struct llfs_inode *raw;
+    struct llfs_inode_info *inodei;
+    struct inode *inode;
+    int i;
 
-    if (!llfs_get_block(dir, 0, &bh)) {
+    inode = iget_locked(sb, ino);
+    if (!inode)
+        return ERR_PTR(-ENOMEM);
+    if (!(inode_state_read(inode) & I_NEW)) /* 既にキャッシュ済み */
+        return inode;
+
+    bh = sb_bread(sb, sbi->itable_block);
+    if (!bh) {
+        iget_failed(inode);
         return ERR_PTR(-EIO);
     }
+    raw = (struct llfs_inode *)(bh->b_data + ino * sbi->inode_size);
 
-    char *ptr = bh->b_data;
-
-    while (1) {
-        struct llfs_dir_entry *dent = (struct llfs_dir_entry *)ptr;
-        if (dent->inode == 0) {
-            break;
-        }
-
-        pr_info(KERN_INFO "looking up: \"%pks\"\n", dent->name);
-
-        if (!strncmp(dent->name, dentry->d_name.name, dent->name_len)) {
-            struct inode *inode = llfs_fill_inode(dir->i_sb, dent->inode);
-            d_add(dentry, inode);
-            return NULL;
-        }
-
-        ptr += dent->rec_len;
+    inodei = kzalloc_obj(*inodei);
+    if (!inodei) {
+        brelse(bh);
+        iget_failed(inode);
+        return ERR_PTR(-ENOMEM);
     }
 
-    pr_info(KERN_INFO "look up: not found\n");
-    d_add(dentry, NULL);
-    return NULL;
+    inode->i_mode = le16_to_cpu(raw->mode);
+    i_uid_write(inode, le16_to_cpu(raw->uid));
+    i_gid_write(inode, 0);
+    inode->i_size = le32_to_cpu(raw->size);
+
+    inodei->blocks = le32_to_cpu(raw->blocks);
+    for (i = 0; i < LLFS_N_BLOCKS; i++)
+        inodei->block[i] = le32_to_cpu(raw->block[i]);
+    inode->i_private = inodei;
+
+    inode->i_mapping->a_ops = &llfs_asops;
+    if (S_ISDIR(inode->i_mode)) {
+        inode->i_op = &llfs_dir_iop;
+        inode->i_fop = &simple_dir_operations;
+        set_nlink(inode, 2);
+    } else {
+        inode->i_op = &llfs_file_iop;
+        inode->i_fop = &llfs_file_fop;
+        set_nlink(inode, 1);
+    }
+
+    brelse(bh);
+    unlock_new_inode(inode);
+    return inode;
 }
 
-static struct inode *llfs_fill_inode(struct super_block *sb, unsigned int ino) {
-    struct inode *inode = new_inode(sb);
-    if (!inode)
-        return NULL;
+struct dentry *llfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
+    struct super_block *sb = dir->i_sb;
+    struct llfs_inode_info *diri = llfs_get_inode_info(dir);
+    struct inode *inode = NULL;
+    unsigned long ino = 0;
+    unsigned int b;
 
-    inode->i_ino = ino;
-    inode->i_sb = sb;
-    inode->i_mode = S_IFREG | 0644;
-    inode->i_size = 10;
-    inode->i_op = &llfs_file_iop;
-    inode->i_fop = &llfs_file_fop;
-    inode->i_mapping->a_ops = &llfs_asops;
+    if (dentry->d_name.len > LLFS_NAME_MAXLEN)
+        return ERR_PTR(-ENAMETOOLONG);
+    if (!diri) /* ディレクトリの inode_info が無い = 異常 */
+        return ERR_PTR(-EIO);
 
-    return inode;
+    /* ディレクトリの各データブロックを走査し、名前が一致する inode 番号を探す */
+    for (b = 0; b < diri->blocks && b < LLFS_N_BLOCKS && !ino; b++) {
+        struct buffer_head *bh;
+        char *p, *end;
+
+        if (!diri->block[b])
+            continue;
+        bh = sb_bread(sb, diri->block[b]);
+        if (!bh)
+            continue;
+
+        p = bh->b_data;
+        end = p + sb->s_blocksize;
+        while (p + sizeof(struct llfs_dir_entry) <= end) {
+            struct llfs_dir_entry *de = (struct llfs_dir_entry *)p;
+            u16 rec_len = le16_to_cpu(de->rec_len);
+
+            if (rec_len < sizeof(struct llfs_dir_entry)) /* 壊れている */
+                break;
+            if (de->inode && de->name_len == dentry->d_name.len &&
+                memcmp(de->name, dentry->d_name.name, de->name_len) == 0) {
+                ino = le32_to_cpu(de->inode);
+                break;
+            }
+            p += rec_len;
+        }
+        brelse(bh);
+    }
+
+    if (ino) {
+        inode = llfs_iget(sb, ino);
+        if (IS_ERR(inode))
+            return ERR_CAST(inode);
+    }
+
+    /* inode==NULL なら負の dentry を作る(= not found) */
+    return d_splice_alias(inode, dentry);
 }
 
 static ssize_t llfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from) {
