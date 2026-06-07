@@ -39,13 +39,24 @@ static int llfs_fill_super(struct super_block *sb, struct fs_context *fc) {
     sb_set_blocksize(sb, 4096);
 
     struct buffer_head *bh;
-    bh = sb_bread(sb, 1);
+    bh = sb_bread(sb, LLFS_ROOT_INODE);
     if (!bh) {
         pr_info(KERN_INFO "sb_bread failed\n");
         return -ENODEV;
     }
 
-    sb->s_magic = (unsigned long)((struct llfs_super_block *)bh->b_data)->magic;
+    struct llfs_super_block *sb_inner = (struct llfs_super_block *)bh->b_data;
+    struct llfs_super_block *sbi;
+
+    if (sb_inner->block_size != 4096) {
+        sb_set_blocksize(sb, sb_inner->block_size);
+    }
+    
+    sbi = kzalloc_obj(*sbi);
+    memcpy(sbi, sb_inner, sizeof(*sbi));
+
+    sb->s_magic = (unsigned)sb_inner->magic;
+    sb->s_fs_info = sbi;
 
     pr_info(KERN_INFO "magic: 0x%08lx\n", sb->s_magic);
 
@@ -54,7 +65,7 @@ static int llfs_fill_super(struct super_block *sb, struct fs_context *fc) {
         return -ENOMEM;
     }
 
-    root_inode->i_ino = get_next_ino();
+    root_inode->i_ino = LLFS_ROOT_INODE;
     root_inode->i_mode = S_IFDIR | 0755;
     root_inode->i_mapping->a_ops = &llfs_asops;
     // root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime = current_time(root_inode);

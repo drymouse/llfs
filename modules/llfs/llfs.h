@@ -9,24 +9,53 @@
 #ifndef __LLFS
 #define __LLFS
 
-#define LLFS_N_BLOCKS 10
+#define LLFS_N_BLOCKS 13
+#define LLFS_NAME_MAXLEN 255
+#define LLFS_ROOT_INODE 1
+#define llfs_get_sb_info(_sb) ((struct llfs_sb_info *)_sb->s_fs_info)
+#define llfs_get_inode_info(_inode) ((struct llfs_inode_info *)_inode->i_private)
 
 struct llfs_super_block {
-    __le32 magic;
+    __le32 magic;              // Magic number
+    __le32 block_size;         // Size of one block
+    __le32 itable_block;       // Block number of inode table
+    __le32 inode_bitmap_block; // Block number of inode bitmap
+    __le32 block_bitmap_block; // Block number of block bitmap
+    __le16 inode_size;         // Inode size (64 in llfs)
+};
+
+struct llfs_sb_info {
+    __le32 magic;              // Magic number
+    __le32 block_size;         // Size of one block
+    __le32 itable_block;       // Block number of inode table
+    __le32 inode_bitmap_block; // Block number of inode bitmap
+    __le32 block_bitmap_block; // Block number of block bitmap
+    __le16 inode_size;         // Inode size (64 in llfs)
 };
 
 struct llfs_inode {
-    __le16 mode;
-    __le32 size;
+    __le16 mode;                 // File mode
+    __le16 uid;                  // Owner Uid
+    __le32 size;                 // File size in bytes
+    __le32 blocks;               // Blocks count
+    __le32 block[LLFS_N_BLOCKS]; // Pointers to blocks
+};
+
+struct llfs_inode_info {
     __le32 blocks;
     __le32 block[LLFS_N_BLOCKS];
 };
 
 struct llfs_dir_entry {
-    __le32 inode;
-    __le16 rec_len;
-    __le16 name_len;
-    char name[];
+    __le32 inode;   // Inode number
+    __le16 rec_len; // Entry length
+    __u8 name_len;  // Filename length
+    __u8 file_type; // File type
+    char name[];    // File name
+};
+
+struct llfs_itable {
+    struct llfs_inode table[];
 };
 
 int llfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode,
