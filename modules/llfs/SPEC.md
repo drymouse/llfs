@@ -167,10 +167,28 @@ register_filesystem(&llfs)
 - 見つかれば `llfs_iget(sb, ino)` → `d_splice_alias`
 - 見つからなければ `d_splice_alias(NULL, dentry)` で負の dentry を作成
 
-### `llfs_make_inode` / `llfs_create`(※書き込み・永続化は未完成)
-- `llfs_get_first_free_inode` で inode bitmap から空き inode を確保
+### `llfs_make_inode` / `llfs_create`(※一部永続化済み・なお要修正)
+- `llfs_get_first_free_inode` で inode bitmap から空き inode を確保(`set_bit` + `mark_buffer_dirty`)
 - `new_inode` で生成 → `inode_init_owner` → `d_instantiate`
-- **まだ itable / ディレクトリへ永続化していない**(create 後にキャッシュが落ちると lookup で見つからない)
+- **itable への mode 書き込み**: `llfs_make_inode` が `llfs_get_itable` で itable を取得し、
+  `itable->table[ino].mode = cpu_to_le16(mode)` を書いて `mark_buffer_dirty`
+  (※ mode のみ。`size` / `blocks` / `block[]` はまだ未書き込み)
+- **ディレクトリエントリへの追加**: `llfs_add_dirent` が dir の block[0] を読み、
+  dirent チェーンを走査して新エントリを書き込み `mark_buffer_dirty`
+  → **`llfs_get_block` の成否判定が反転していた不具合を修正し、dirent が更新されるようになった**
+
+#### `llfs_add_dirent` の現状の制約(要修正の沼候補)
+1. **空きスロット探索が ext2 流の「最後のエントリを分割」に未対応** —
+   `inode == 0` のスロットを線形探索するだけ。`mkfs.py` のルートは `.`/`..` のみで
+   `inode==0` の空きが無く、`..` の `rec_len` がブロック末尾まで伸びているため、
+   走査がブロック末尾を越えてバッファ外参照になりうる(last-entry split が必要)
+2. **エンディアン未変換** — 走査時の `ptr += dirent->rec_len` や書き込み時の
+   `rec_len` / `inode` 設定で `le16_to_cpu` / `cpu_to_le16` 等を一部通していない
+3. **`rec_len` の計算が不正確** — `name_len + 9` としているが、ヘッダは 8 バイトなので
+   最小長は `8 + name_len`(+ 4バイト境界丸め)が正
+4. **`file_type` が `LLFS_FT_REG` 固定** — `mode` から `LLFS_FT_DIR` 等へ出し分けるべき(TODO)
+5. **`llfs_create` の inode エラー判定** — `llfs_make_inode` は `ERR_PTR` を返すのに
+   `if (!inode)`(NULL チェック)で受けており、`IS_ERR(inode)` で見るべき
 
 ## 5. アドレス空間 / iomap(`iomap.c`)
 
@@ -209,15 +227,24 @@ register_filesystem(&llfs)
 - `iomap_begin` / `iomap_end`(実マッピングなし → 読み書きの実体が動かない)
 - **readdir**: ルートは `simple_dir_operations`(dcache ベース)のため、
   オンディスクのディレクトリエントリを `ls` で列挙しない(名前指定の lookup は動く)
-- **create の永続化**: 新規 inode を itable / ディレクトリエントリ / `i_size` 更新として書き戻していない
+- **create の永続化(部分的に実装)**:
+  - 済: inode bitmap の確保、itable への mode 書き込み、ディレクトリエントリへの追加
+  - 未: itable への `size` / `blocks` / `block[]` 書き込み、dir の `i_size` 更新、
+    `llfs_add_dirent` の ext2 流 last-entry split / エンディアン / `rec_len` / `file_type` 修正
+    (詳細はセクション4参照)
 - ブロック割り当て(block bitmap を使った data block 確保)
 
 ### 矛盾・要注意点(沼の原因候補)
-1. **create と lookup の非対称** — create は永続化せず `d_instantiate` のみ。キャッシュが落ちると lookup(ディスク走査)で見つからない
+1. **create と lookup の非対称(緩和中)** — create は itable mode と dirent を書き戻すようになったが、
+   `size` / `block[]` 等は未永続化。`llfs_add_dirent` のスロット探索も未完成のため、
+   ルートに既存の `.`/`..` しか無い状態だと走査がバッファ外に出るリスクが残る
 2. `llfs.h` で **`NULL` を `(unsigned long)0` に再定義** — ポインタ文脈で型的に危険
-3. `llfs_get_block` / `llfs_fill_inode_info` は修正済みだが現状未使用(`__maybe_unused`)。iomap 経路で使う想定
+3. `llfs_fill_inode_info` は現状未使用(`__maybe_unused`)。iomap 経路で使う想定
+   (`llfs_get_block` は `llfs_add_dirent` から使用されるようになった)
 
 ### 解決済み(過去の沼)
+- ~~`llfs_add_dirent` が成否判定反転で即 return~~ → `if (!llfs_get_block(...))` を
+  `if (llfs_get_block(...))` に修正。dirent が更新されるようになった
 - ~~`sb->s_op` 未割当~~ → `llfs_sop` を割当(`evict_inode` で `i_private` 解放)
 - ~~lookup が常に ino=2~~ → ディレクトリ走査 + `llfs_iget` + `d_splice_alias`
 - ~~`kill_sb` が `kill_block_super` を呼ばない~~ → 呼ぶように修正(+ `s_fs_info` 解放)
