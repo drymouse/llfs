@@ -18,10 +18,16 @@ static unsigned int llfs_get_first_free_inode(struct super_block *sb) {
 
     /* find_first_zero_bit の第2引数はビット数。block_size はバイト数なので 8 倍する */
     unsigned int res = find_first_zero_bit(bitmap, sbi->block_size * 8);
+    if (res == 0 || res >= LLFS_BLOCK_SIZE << 3) {
+        pr_warn("unsound ino\n");
+        return 0;
+    }
     set_bit(res, bitmap);
     mark_buffer_dirty(bh);
 
     brelse(bh);
+
+    pr_info(KERN_INFO "first free node: %d\n", res);
 
     return res;
 }
@@ -50,7 +56,7 @@ static int llfs_fill_inode_info(struct inode *inode, struct llfs_inode_info *ino
 }
 
 static int __maybe_unused llfs_get_block(struct inode *inode, unsigned int sector,
-                                          struct buffer_head **bh) {
+                                         struct buffer_head **bh) {
     struct llfs_inode_info *inodei = llfs_get_inode_info(inode);
 
     if (sector >= LLFS_N_BLOCKS) {
@@ -74,6 +80,53 @@ static int __maybe_unused llfs_get_block(struct inode *inode, unsigned int secto
     if (!*bh) {
         return -1;
     }
+
+    return 0;
+}
+
+static struct llfs_itable *llfs_get_itable(struct super_block *sb, struct buffer_head **bh) {
+    struct llfs_sb_info *sbi = llfs_get_sb_info(sb);
+    *bh = sb_bread(sb, sbi->itable_block);
+    if (!*bh)
+        return ERR_PTR(-EIO);
+
+    return (struct llfs_itable *)(*bh)->b_data;
+}
+
+static int llfs_add_dirent(struct inode *dir, struct dentry *dentry, struct inode *inode) {
+    struct buffer_head *bh;
+    if (llfs_get_block(dir, 0, &bh)) {
+        return -1;
+    }
+
+    unsigned name_len = strlen(dentry->d_name.name);
+
+    if (name_len > LLFS_NAME_MAXLEN) {
+        brelse(bh);
+        return -1;
+    }
+
+    char *ptr = bh->b_data;
+    struct llfs_dir_entry *dirent;
+
+    while (1) {
+        dirent = (struct llfs_dir_entry *)ptr;
+
+        if (dirent->inode == 0) {
+            break;
+        }
+
+        ptr += le16_to_cpu(dirent->rec_len);
+    }
+
+    dirent->inode = cpu_to_le32(inode->i_ino);
+    dirent->name_len = (u8)name_len;
+    dirent->file_type = LLFS_FT_REG; // TODO
+    dirent->rec_len = cpu_to_le16(((name_len >> 2) << 2) + 4 + 8);
+    memcpy(dirent->name, dentry->d_name.name, name_len);
+
+    mark_buffer_dirty(bh);
+    brelse(bh);
 
     return 0;
 }
@@ -115,11 +168,11 @@ struct inode *llfs_make_inode(struct super_block *sb, umode_t mode, void *data) 
     struct inode *inode = new_inode(sb);
 
     if (!inode)
-        return (struct inode *)NULL;
+        return ERR_PTR(-ENOMEM);
 
     unsigned int ino = llfs_get_first_free_inode(sb);
     if (!ino)
-        return (struct inode *)NULL;
+        return ERR_PTR(-EIO);
 
     inode->i_ino = ino;
     inode->i_private = data;
@@ -131,10 +184,23 @@ struct inode *llfs_make_inode(struct super_block *sb, umode_t mode, void *data) 
     } else {
         inode->i_op = &llfs_file_iop;
         inode->i_fop = &llfs_file_fop;
-        inode->i_size = 0;
+        set_nlink(inode, 1);
     }
 
+    inode->i_blocks = 0;
+    inode->i_size = 0;
     inode->i_mapping->a_ops = &llfs_asops;
+
+    // itableに登録
+    struct buffer_head *bh;
+    struct llfs_itable *itable = llfs_get_itable(sb, &bh);
+    if (IS_ERR(itable))
+        return ERR_PTR(-EIO);
+
+    itable->table[ino].mode = cpu_to_le16((u16)mode);
+
+    mark_buffer_dirty(bh);
+    brelse(bh);
 
     return inode;
 }
@@ -149,6 +215,9 @@ int llfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentr
         return -ENOMEM;
 
     inode_init_owner(idmap, inode, dir, mode);
+
+    // dirに登録
+    llfs_add_dirent(dir, dentry, inode);
 
     d_instantiate(dentry, inode);
 

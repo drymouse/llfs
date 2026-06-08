@@ -29,7 +29,7 @@ const struct iomap_writeback_ops llfs_writeback_ops = {};
 
 static int llfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length, unsigned flags,
                             struct iomap *iomap, struct iomap *srcmap) {
-    pr_info(KERN_INFO "llfs iomap begin...\n");
+    pr_info("llfs iomap begin...\n");
     
     iomap->bdev = inode->i_sb->s_bdev;
     iomap->addr = 0x800;
@@ -57,7 +57,7 @@ static void llfs_readahead(struct readahead_control *rac) {
 }
 
 static int llfs_writepages(struct address_space *mapping, struct writeback_control *wbc) {
-    pr_info(KERN_INFO "LLFS write pages\n");
+    pr_info("LLFS write pages\n");
     struct iomap_writepage_ctx wpc = {
         .inode = mapping->host,
         .wbc = wbc,
