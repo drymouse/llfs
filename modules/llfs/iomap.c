@@ -99,7 +99,7 @@ static int llfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length, u
         inode->i_blocks++;
 
         mark_inode_dirty(inode);
-        iomap->type |= IOMAP_F_NEW;
+        iomap->flags |= IOMAP_F_NEW;
     }
 
     iomap->addr = bno << LLFS_BLOCK_SIZE_SHIFT;

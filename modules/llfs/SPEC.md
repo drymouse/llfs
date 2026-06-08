@@ -150,7 +150,7 @@ register_filesystem(&llfs)
 
 | オペレーション | 内容 |
 |---|---|
-| `super_operations llfs_sop` | `.statfs = simple_statfs`, `.evict_inode = llfs_evict_inode`(**`sb->s_op` に割当済み**) |
+| `super_operations llfs_sop` | `.statfs = simple_statfs`, `.evict_inode = llfs_evict_inode`, `.write_inode = llfs_write_inode`(**`sb->s_op` に割当済み**) |
 | `inode_operations llfs_dir_iop` | `.create = llfs_create`, `.lookup = llfs_lookup` |
 | `inode_operations llfs_file_iop` | **空 `{}`** |
 | `file_operations llfs_file_fop` | `generic_file_read_iter` / `llfs_file_write_iter`(iomap) / `generic_file_mmap` / `generic_file_llseek` |
@@ -167,41 +167,65 @@ register_filesystem(&llfs)
 - 見つかれば `llfs_iget(sb, ino)` → `d_splice_alias`
 - 見つからなければ `d_splice_alias(NULL, dentry)` で負の dentry を作成
 
-### `llfs_make_inode` / `llfs_create`(※一部永続化済み・なお要修正)
+### `llfs_write_inode`(inode メタデータの唯一の永続化窓口)
+- `super_operations.write_inode` として登録。`mark_inode_dirty` 起点で VFS が呼ぶ
+- `llfs_get_itable` で itable を読み、`itable->table[i_ino]` へ
+  `mode` / `uid` / `size`(= `i_size`)/ `blocks`(= `i_blocks`)を `cpu_to_le*` で直列化し、
+  `block[]` は `memcpy(dinode->block, inodei->block, ...)` で丸ごとコピー → `mark_buffer_dirty`
+- **方針**: 「書き換えは各所(`iomap_begin` 等)、ディスク反映は `write_inode` 一箇所」。
+  これにより `llfs_make_inode` が以前やっていた itable 直書きは廃止(コードはコメントアウト済み)
+
+### `llfs_make_inode` / `llfs_create`(mount/touch で動作確認済み)
 - `llfs_get_first_free_inode` で inode bitmap から空き inode を確保(`set_bit` + `mark_buffer_dirty`)
-- `new_inode` で生成 → `inode_init_owner` → `d_instantiate`
-- **itable への mode 書き込み**: `llfs_make_inode` が `llfs_get_itable` で itable を取得し、
-  `itable->table[ino].mode = cpu_to_le16(mode)` を書いて `mark_buffer_dirty`
-  (※ mode のみ。`size` / `blocks` / `block[]` はまだ未書き込み)
+- `new_inode` で生成 → `i_op`/`i_fop`/nlink 設定 → `i_blocks=0` / `i_size=0` / `a_ops`
+  (itable への書き込みはここでは行わない。永続化は後続の `mark_inode_dirty`→`write_inode`)
+- `llfs_create`: `llfs_make_inode` → `inode_init_owner` → `llfs_add_dirent` → `d_instantiate`
+  → `mark_inode_dirty(dir)` / `mark_inode_dirty(inode)`
 - **ディレクトリエントリへの追加**: `llfs_add_dirent` が dir の block[0] を読み、
   dirent チェーンを走査して新エントリを書き込み `mark_buffer_dirty`
-  → **`llfs_get_block` の成否判定が反転していた不具合を修正し、dirent が更新されるようになった**
 
 #### `llfs_add_dirent` の現状の制約(要修正の沼候補)
 1. **空きスロット探索が ext2 流の「最後のエントリを分割」に未対応** —
    `inode == 0` のスロットを線形探索するだけ。`mkfs.py` のルートは `.`/`..` のみで
    `inode==0` の空きが無く、`..` の `rec_len` がブロック末尾まで伸びているため、
    走査がブロック末尾を越えてバッファ外参照になりうる(last-entry split が必要)
-2. **エンディアン未変換** — 走査時の `ptr += dirent->rec_len` や書き込み時の
-   `rec_len` / `inode` 設定で `le16_to_cpu` / `cpu_to_le16` 等を一部通していない
-3. **`rec_len` の計算が不正確** — `name_len + 9` としているが、ヘッダは 8 バイトなので
-   最小長は `8 + name_len`(+ 4バイト境界丸め)が正
-4. **`file_type` が `LLFS_FT_REG` 固定** — `mode` から `LLFS_FT_DIR` 等へ出し分けるべき(TODO)
-5. **`llfs_create` の inode エラー判定** — `llfs_make_inode` は `ERR_PTR` を返すのに
-   `if (!inode)`(NULL チェック)で受けており、`IS_ERR(inode)` で見るべき
+2. **`rec_len` の計算**: `((name_len >> 2) << 2) + 4 + 8`(= 4バイト境界丸め + ヘッダ8)
+   としエンディアン変換済み。走査側 `ptr += le16_to_cpu(dirent->rec_len)` も変換済み
+3. **`file_type` が `LLFS_FT_REG` 固定** — `mode` から `LLFS_FT_DIR` 等へ出し分けるべき(TODO)
+4. **`llfs_create` の inode エラー判定** — `llfs_make_inode` は `ERR_PTR` を返すのに
+   `if (!inode)`(NULL チェック)で受けており、`IS_ERR(inode)` で見るべき(`llfs_add_dirent`
+   の戻り値も無視している)
 
 ## 5. アドレス空間 / iomap(`iomap.c`)
 
 | オペレーション | 内容 |
 |---|---|
-| `address_space_operations llfs_asops` | `read_folio` / `readahead` / `writepages`(+ 検討中の `write_begin`/`write_end`) |
-| `iomap_ops llfs_iomap_ops` | `iomap_begin` / `iomap_end`(**両方スタブ、`return 0` のみ**) |
-| `iomap_writeback_ops llfs_writeback_ops` | **空 `{}`** |
+| `address_space_operations llfs_asops` | `read_folio` / `readahead` / `writepages` |
+| `iomap_ops llfs_iomap_ops` | `iomap_begin`(実マッピング)/ `iomap_end`(サイズ変更を dirty 化) |
+| `iomap_writeback_ops llfs_writeback_ops` | `writeback_range = llfs_writeback_range`, `writeback_submit = iomap_ioend_writeback_submit` |
+| `iomap_write_ops llfs_iomap_wops` | **空 `{}`**(`iomap_file_buffered_write` の第4引数に非NULLで渡す用) |
 
-- `read_folio` → `iomap_bio_read_folio`
-- `readahead` → `iomap_bio_readahead`
-- `writepages` → `iomap_writepages`
-- 書き込み経路は現在迷走中(`generic_file_write_iter` ↔ `iomap_file_buffered_write` の切替を検討)
+- read: `read_folio` → `iomap_bio_read_folio` / `readahead` → `iomap_bio_readahead`
+- buffered write: `llfs_file_write_iter` → `iomap_file_buffered_write(.., &llfs_iomap_ops, &llfs_iomap_wops, NULL)` → `generic_write_sync`
+- writeback: `writepages` → `iomap_writepages` → `llfs_writeback_range`
+
+### `llfs_iomap_begin`(論理→物理ブロック変換)
+- `sector = offset >> LLFS_BLOCK_SIZE_SHIFT`。`sector >= LLFS_N_BLOCKS` は `-EIO`
+- `llfs_get_inode_info_checked` で `inode_info` を遅延充填してから `block[sector]` を引く
+- `block[sector] != 0`: `IOMAP_MAPPED`、`addr = bno << LLFS_BLOCK_SIZE_SHIFT`
+- `block[sector] == 0` かつ read: `IOMAP_HOLE` / `addr = IOMAP_NULL_ADDR`(ゼロ埋め)
+- `block[sector] == 0` かつ `IOMAP_WRITE`: `llfs_alloc_block` で block bitmap から確保し、
+  `inode_info->block[sector] = bno` / `i_blocks++` / `mark_inode_dirty`(→ `write_inode` で永続化)
+
+### `llfs_alloc_block`(block bitmap アロケータ)
+- `sbi->block_bitmap_block` を読み `find_first_zero_bit` → `set_bit` → `mark_buffer_dirty`
+- `inode bitmap` 版(`llfs_get_first_free_inode`)と同型。ロックは無し(単一スレッド前提)
+
+### `llfs_iomap_end` / `llfs_writeback_range`
+- `iomap_end`: `iomap->flags & IOMAP_F_SIZE_CHANGED` なら `mark_inode_dirty`(`i_size` 永続化を起動)
+  ※ `i_size` 自体はカーネルの buffered write が更新済み(FSは反映のみ担当)
+- `writeback_range`: キャッシュ済み `wpc->iomap` が `offset` を外れていたら
+  `llfs_iomap_begin(.., IOMAP_WRITE, ..)` で張り直し → `iomap_add_to_ioend`(gfs2/zonefs と同型)
 
 ### v7.0.10 の iomap API メモ
 - `iomap_file_buffered_write(iocb, from, ops, write_ops, private)` の **5引数**
@@ -217,32 +241,37 @@ register_filesystem(&llfs)
 
 ## 7. 「動く」状態と未実装の境界
 
-### 動作確認済み(ビルドレベル)
-- モジュールロード / FS 登録
-- マウント → スーパーブロックを `llfs_sb_info` に取り込み(ネイティブ型)
+### 動作確認済み(実機・コマンドレベル)
+- モジュールロード / FS 登録 / マウント(`llfs_sb_info` 取り込み、ネイティブ型)
 - `llfs_iget` でルート inode を itable から読み込み
 - `mkfs.py` が有効なイメージ(SB / root inode / `.`/`..` / 両 bitmap)を生成
+- **`touch`**: 空ファイル作成(inode 確保 + dirent 追加 + `write_inode` 永続化)
+- **`echo > file`**: buffered write → `iomap_begin` でブロック割当 → ページキャッシュ書込
+- **`sync`**: `writepages`→`writeback_range` でデータを、`write_inode` でメタを itable へ書き戻し
 
 ### スタブ / 未実装
-- `iomap_begin` / `iomap_end`(実マッピングなし → 読み書きの実体が動かない)
 - **readdir**: ルートは `simple_dir_operations`(dcache ベース)のため、
   オンディスクのディレクトリエントリを `ls` で列挙しない(名前指定の lookup は動く)
-- **create の永続化(部分的に実装)**:
-  - 済: inode bitmap の確保、itable への mode 書き込み、ディレクトリエントリへの追加
-  - 未: itable への `size` / `blocks` / `block[]` 書き込み、dir の `i_size` 更新、
-    `llfs_add_dirent` の ext2 流 last-entry split / エンディアン / `rec_len` / `file_type` 修正
-    (詳細はセクション4参照)
-- ブロック割り当て(block bitmap を使った data block 確保)
+- **`llfs_add_dirent` の ext2 流 last-entry split**(セクション4参照)。`file_type` も REG 固定
+- 間接ブロック無し → 最大ファイルサイズ 52KiB(直接13ブロック)。`unlink` / `mkdir` / `truncate` 未実装
+- `llfs_iomap_wops` / `llfs_file_iop` は空 `{}`
 
 ### 矛盾・要注意点(沼の原因候補)
-1. **create と lookup の非対称(緩和中)** — create は itable mode と dirent を書き戻すようになったが、
-   `size` / `block[]` 等は未永続化。`llfs_add_dirent` のスロット探索も未完成のため、
-   ルートに既存の `.`/`..` しか無い状態だと走査がバッファ外に出るリスクが残る
-2. `llfs.h` で **`NULL` を `(unsigned long)0` に再定義** — ポインタ文脈で型的に危険
-3. `llfs_fill_inode_info` は現状未使用(`__maybe_unused`)。iomap 経路で使う想定
-   (`llfs_get_block` は `llfs_add_dirent` から使用されるようになった)
+1. **`blocks` カウントの意味が不統一** — `i_blocks` は本来 512B 単位だが
+   `iomap_begin` は fs ブロックあたり +1 で増やし、`write_inode` はそれを `dinode->blocks` に直書き。
+   一方 `iget` は `raw->blocks` を `inode_info->blocks` に読むだけで `i_blocks` には載せない
+   → 再マウント後に blocks がラウンドトリップしない
+2. **`bno << SHIFT` が32bit演算**(`iomap_begin`)。本FS最大では溢れないが `(u64)bno` キャスト推奨
+3. `llfs.h` で **`NULL` を `(unsigned long)0` に再定義** — ポインタ文脈で型的に危険
+4. `llfs_create` がエラーを握り潰す(`if (!inode)` で `ERR_PTR` を素通し、`llfs_add_dirent`
+   の戻り値も無視)
 
 ### 解決済み(過去の沼)
+- ~~`IOMAP_F_NEW` が実効していない~~ → `iomap->flags |= IOMAP_F_NEW`(正しいフィールド)に修正。
+  新規割当ブロックがゼロ初期化され、部分書き込みでのゴミ露出が解消
+- ~~iomap_begin/end・writeback_ops がスタブ~~ → 実マッピング実装。touch/echo/sync が動作
+- ~~create の永続化が mode のみ~~ → `write_inode`(`.write_inode`)を導入し
+  `size`/`blocks`/`block[]` も itable へ書き戻し。itable 直書きは `write_inode` に集約
 - ~~`llfs_add_dirent` が成否判定反転で即 return~~ → `if (!llfs_get_block(...))` を
   `if (llfs_get_block(...))` に修正。dirent が更新されるようになった
 - ~~`sb->s_op` 未割当~~ → `llfs_sop` を割当(`evict_inode` で `i_private` 解放)
