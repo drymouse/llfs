@@ -1,3 +1,4 @@
+#include <linux/buffer_head.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/iomap.h>
@@ -14,7 +15,9 @@
 #define LLFS_NAME_MAXLEN 255
 #define LLFS_ROOT_INODE 1
 #define LLFS_SB_BLOCK 1
-#define LLFS_BLOCK_SIZE 4096
+#define LLFS_BLOCK_SIZE_SHIFT 12
+#define LLFS_BLOCK_SIZE (1 << LLFS_BLOCK_SIZE_SHIFT)
+
 
 /* llfs_dir_entry.file_type */
 #define LLFS_FT_UNKNOWN 0
@@ -72,5 +75,10 @@ struct dentry *llfs_lookup(struct inode *dir, struct dentry *dentry, unsigned in
 
 struct inode *llfs_make_inode(struct super_block *sb, umode_t mode, void *data);
 struct inode *llfs_iget(struct super_block *sb, unsigned long ino);
+
+struct llfs_inode_info *llfs_get_inode_info_checked(struct inode *inode);
+int llfs_get_block(struct inode *inode, unsigned int sector, struct buffer_head **bh);
+unsigned llfs_alloc_block(struct super_block *sb);
+struct llfs_itable *llfs_get_itable(struct super_block *sb, struct buffer_head **bh);
 
 #endif

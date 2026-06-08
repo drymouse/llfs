@@ -55,24 +55,32 @@ static int llfs_fill_inode_info(struct inode *inode, struct llfs_inode_info *ino
     return 0;
 }
 
-static int __maybe_unused llfs_get_block(struct inode *inode, unsigned int sector,
-                                         struct buffer_head **bh) {
+struct llfs_inode_info *llfs_get_inode_info_checked(struct inode *inode) {
     struct llfs_inode_info *inodei = llfs_get_inode_info(inode);
-
-    if (sector >= LLFS_N_BLOCKS) {
-        return -1;
-    }
 
     if (!inodei) {
         inodei = kzalloc_obj(*inodei);
         if (!inodei) {
-            return -1;
+            return ERR_PTR(-ENOMEM);
         }
         if (llfs_fill_inode_info(inode, inodei) < 0) {
             kfree(inodei);
-            return -1;
+            return ERR_PTR(-EIO);
         }
         inode->i_private = inodei;
+    }
+
+    return inodei;
+}
+
+int llfs_get_block(struct inode *inode, unsigned int sector, struct buffer_head **bh) {
+    struct llfs_inode_info *inodei = llfs_get_inode_info_checked(inode);
+
+    if (IS_ERR(inodei))
+        return -1;
+
+    if (sector >= LLFS_N_BLOCKS) {
+        return -1;
     }
 
     *bh = sb_bread(inode->i_sb, inodei->block[sector]);
@@ -84,7 +92,7 @@ static int __maybe_unused llfs_get_block(struct inode *inode, unsigned int secto
     return 0;
 }
 
-static struct llfs_itable *llfs_get_itable(struct super_block *sb, struct buffer_head **bh) {
+struct llfs_itable *llfs_get_itable(struct super_block *sb, struct buffer_head **bh) {
     struct llfs_sb_info *sbi = llfs_get_sb_info(sb);
     *bh = sb_bread(sb, sbi->itable_block);
     if (!*bh)
@@ -140,9 +148,30 @@ static void llfs_evict_inode(struct inode *inode) {
     inode->i_private = NULL;
 }
 
+static int llfs_write_inode(struct inode *inode, struct writeback_control *wbc) {
+    struct buffer_head *bh;
+    struct llfs_itable *itable = llfs_get_itable(inode->i_sb, &bh);
+    if (IS_ERR(itable))
+        return -EIO;
+    
+    struct llfs_inode *dinode = &itable->table[inode->i_ino];
+    struct llfs_inode_info *inodei = llfs_get_inode_info(inode);
+    
+    dinode->mode = cpu_to_le16(inode->i_mode);
+    dinode->uid = cpu_to_le16(inode->i_uid.val);
+    dinode->size = cpu_to_le32(inode->i_size);
+    dinode->blocks = cpu_to_le32(inode->i_blocks);
+    memcpy(dinode->block, inodei->block, sizeof(dinode->block));
+
+    mark_buffer_dirty(bh);
+    brelse(bh);
+    return 0;
+}
+
 const struct super_operations llfs_sop = {
     .statfs = simple_statfs,
     .evict_inode = llfs_evict_inode,
+    .write_inode = llfs_write_inode,
 };
 
 const struct inode_operations llfs_dir_iop = {
@@ -192,15 +221,15 @@ struct inode *llfs_make_inode(struct super_block *sb, umode_t mode, void *data) 
     inode->i_mapping->a_ops = &llfs_asops;
 
     // itableに登録
-    struct buffer_head *bh;
-    struct llfs_itable *itable = llfs_get_itable(sb, &bh);
-    if (IS_ERR(itable))
-        return ERR_PTR(-EIO);
+    // struct buffer_head *bh;
+    // struct llfs_itable *itable = llfs_get_itable(sb, &bh);
+    // if (IS_ERR(itable))
+    //     return ERR_PTR(-EIO);
 
-    itable->table[ino].mode = cpu_to_le16((u16)mode);
+    // itable->table[ino].mode = cpu_to_le16((u16)mode);
 
-    mark_buffer_dirty(bh);
-    brelse(bh);
+    // mark_buffer_dirty(bh);
+    // brelse(bh);
 
     return inode;
 }

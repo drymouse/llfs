@@ -25,6 +25,7 @@ while [ $# -gt 0 ]; do
         --gdb)      GDB_MODE=1; shift ;;
         --test)     shift; TEST_CMD="${1:?--test requires a command}"; shift ;;
         --bdev)     WITH_BDEV=1; shift ;;
+        --refresh)  REFRESH=1; shift ;;
         --)         shift; EXTRA_QEMU_ARGS=("$@"); break ;;
         -h|--help)
             echo "Usage: $0 [--gdb] [--test CMD] [-- QEMU_ARGS...]"
@@ -36,6 +37,10 @@ done
 if [ "$WITH_BDEV" -eq 1 ]; then
     QEMU_ARGS+=(-drive file=vdisk.img,format=raw,index=1,media=disk)
     # echo "QEMU waiting for GDB on localhost:$QEMU_GDB_PORT"
+fi
+
+if [ "$REFRESH" -eq 1]; then
+    uv run ./modules/llfs/mkfs.py ./vdisk.img
 fi
 
 QEMU_ARGS+=("${EXTRA_QEMU_ARGS[@]+"${EXTRA_QEMU_ARGS[@]}"}")
