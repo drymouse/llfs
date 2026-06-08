@@ -172,13 +172,21 @@ register_filesystem(&llfs)
 - `llfs_get_itable` で itable を読み、`itable->table[i_ino]` へ
   `mode` / `uid` / `size`(= `i_size`)/ `blocks`(= `i_blocks`)を `cpu_to_le*` で直列化し、
   `block[]` は `memcpy(dinode->block, inodei->block, ...)` で丸ごとコピー → `mark_buffer_dirty`
+- `inode_info` は **`llfs_get_inode_info_checked`** で取得(NULL ガード)。`touch` 直後など
+  一度も `iomap_begin` を通っていない inode(`i_private==NULL`)でも itable から遅延充填され、
+  NULL 参照を起こさない
 - **方針**: 「書き換えは各所(`iomap_begin` 等)、ディスク反映は `write_inode` 一箇所」。
   これにより `llfs_make_inode` が以前やっていた itable 直書きは廃止(コードはコメントアウト済み)
 
 ### `llfs_make_inode` / `llfs_create`(mount/touch で動作確認済み)
 - `llfs_get_first_free_inode` で inode bitmap から空き inode を確保(`set_bit` + `mark_buffer_dirty`)
-- `new_inode` で生成 → `i_op`/`i_fop`/nlink 設定 → `i_blocks=0` / `i_size=0` / `a_ops`
+- `new_inode` で生成 → `i_ino` 設定 → **`insert_inode_hash(inode)`** → `i_op`/`i_fop`/nlink 設定
+  → `i_blocks=0` / `i_size=0` / `a_ops`
   (itable への書き込みはここでは行わない。永続化は後続の `mark_inode_dirty`→`write_inode`)
+- **`insert_inode_hash` が必須**: `new_inode()` は hash 登録をしないため、未登録のままだと
+  `__mark_inode_dirty` が `inode_unhashed()` で弾いて superblock の dirty list に載せず、
+  `write_inode` が一切呼ばれない(`fs/fs-writeback.c` の「Only add valid (hashed) inodes」分岐)。
+  root(ino=1)は `iget_locked` 経由で hash 済みなので影響を受けず、新規ファイルだけ永続化されなかった
 - `llfs_create`: `llfs_make_inode` → `inode_init_owner` → `llfs_add_dirent` → `d_instantiate`
   → `mark_inode_dirty(dir)` / `mark_inode_dirty(inode)`
 - **ディレクトリエントリへの追加**: `llfs_add_dirent` が dir の block[0] を読み、
@@ -267,6 +275,14 @@ register_filesystem(&llfs)
    の戻り値も無視)
 
 ### 解決済み(過去の沼)
+- ~~新規ファイル(ino≥2)の `write_inode` が呼ばれず永続化されない~~ →
+  `llfs_make_inode` に **`insert_inode_hash(inode)`** を追加。`new_inode()` は hash 登録しないため、
+  未登録だと `__mark_inode_dirty` が dirty list に載せず writeback 対象外になっていた
+  (root=ino1 は `iget_locked` で hash 済みのため唯一書き戻されていた)。
+  併せて `write_inode` の `inode_info` 取得を **`llfs_get_inode_info_checked`** にして、
+  hash 修正で到達するようになった `touch` 済み(`i_private==NULL`)inode の NULL 参照を予防。
+  なお当初 `IOMAP_F_NEW` 修正が原因と疑ったが無関係(同フラグの効果は write_begin の
+  ゼロ埋め判定 `iomap_block_needs_zeroing` のみで、`write_inode` の永続化経路には不関与)
 - ~~`IOMAP_F_NEW` が実効していない~~ → `iomap->flags |= IOMAP_F_NEW`(正しいフィールド)に修正。
   新規割当ブロックがゼロ初期化され、部分書き込みでのゴミ露出が解消
 - ~~iomap_begin/end・writeback_ops がスタブ~~ → 実マッピング実装。touch/echo/sync が動作

@@ -39,7 +39,7 @@ if [ "$WITH_BDEV" -eq 1 ]; then
     # echo "QEMU waiting for GDB on localhost:$QEMU_GDB_PORT"
 fi
 
-if [ "$REFRESH" -eq 1]; then
+if [ "$REFRESH" -eq 1 ]; then
     uv run ./modules/llfs/mkfs.py ./vdisk.img
 fi
 

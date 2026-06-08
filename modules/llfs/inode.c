@@ -149,14 +149,20 @@ static void llfs_evict_inode(struct inode *inode) {
 }
 
 static int llfs_write_inode(struct inode *inode, struct writeback_control *wbc) {
+    pr_info("llfs write inode: %lu\n", inode->i_ino);
+    
     struct buffer_head *bh;
     struct llfs_itable *itable = llfs_get_itable(inode->i_sb, &bh);
     if (IS_ERR(itable))
         return -EIO;
     
     struct llfs_inode *dinode = &itable->table[inode->i_ino];
-    struct llfs_inode_info *inodei = llfs_get_inode_info(inode);
-    
+    struct llfs_inode_info *inodei = llfs_get_inode_info_checked(inode);
+    if (IS_ERR(inodei)) {
+        brelse(bh);
+        return PTR_ERR(inodei);
+    }
+
     dinode->mode = cpu_to_le16(inode->i_mode);
     dinode->uid = cpu_to_le16(inode->i_uid.val);
     dinode->size = cpu_to_le32(inode->i_size);
@@ -206,6 +212,10 @@ struct inode *llfs_make_inode(struct super_block *sb, umode_t mode, void *data) 
     inode->i_ino = ino;
     inode->i_private = data;
 
+    /* new_inode() は hash 登録をしないため、ここで登録する。
+     * 未登録だと __mark_inode_dirty が dirty list に載せず write_inode が呼ばれない */
+    insert_inode_hash(inode);
+
     if (S_ISDIR(mode)) {
         inode->i_op = &llfs_dir_iop;
         inode->i_fop = &simple_dir_operations;
@@ -220,23 +230,12 @@ struct inode *llfs_make_inode(struct super_block *sb, umode_t mode, void *data) 
     inode->i_size = 0;
     inode->i_mapping->a_ops = &llfs_asops;
 
-    // itableに登録
-    // struct buffer_head *bh;
-    // struct llfs_itable *itable = llfs_get_itable(sb, &bh);
-    // if (IS_ERR(itable))
-    //     return ERR_PTR(-EIO);
-
-    // itable->table[ino].mode = cpu_to_le16((u16)mode);
-
-    // mark_buffer_dirty(bh);
-    // brelse(bh);
-
     return inode;
 }
 
 int llfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode,
                 bool excl) {
-    printk(KERN_INFO "creating a file: %pks", (void *)dentry->d_name.name);
+    printk("creating a file: %pks", (void *)dentry->d_name.name);
 
     struct inode *inode = llfs_make_inode(dir->i_sb, mode, (void *)NULL);
 
