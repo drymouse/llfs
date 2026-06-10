@@ -7,6 +7,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 QEMU_ARGS=(
   -enable-kvm 
+  -cpu host
   -m 2G 
   -smp 2 
   -kernel linux-7.0.10/arch/x86_64/boot/bzImage 

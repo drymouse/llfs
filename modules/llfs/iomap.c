@@ -63,7 +63,7 @@ const struct iomap_writeback_ops llfs_writeback_ops = {
 
 static int llfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length, unsigned flags,
                             struct iomap *iomap, struct iomap *srcmap) {
-    pr_info("llfs iomap begin...\n");
+    // pr_info("llfs iomap begin...\n");
 
     struct llfs_inode_info *inodei = llfs_get_inode_info_checked(inode);
     if (IS_ERR(inodei)) {
@@ -110,7 +110,7 @@ static int llfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length, u
 
 static int llfs_iomap_end(struct inode *inode, loff_t offset, loff_t length, ssize_t written,
                           unsigned flags, struct iomap *iomap) {
-    pr_info(KERN_INFO "llfs iomap end...\n");
+    // pr_info(KERN_INFO "llfs iomap end...\n");
 
     if (iomap->flags & IOMAP_F_SIZE_CHANGED) {
         mark_inode_dirty(inode);
