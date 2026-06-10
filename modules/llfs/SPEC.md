@@ -294,3 +294,255 @@ register_filesystem(&llfs)
 - ~~lookup が常に ino=2~~ → ディレクトリ走査 + `llfs_iget` + `d_splice_alias`
 - ~~`kill_sb` が `kill_block_super` を呼ばない~~ → 呼ぶように修正(+ `s_fs_info` 解放)
 - ~~インメモリ構造体が `__le*`~~ → `llfs_sb_info` / `llfs_inode_info` をネイティブ型へ
+
+---
+
+## 8. ジャーナリング設計(WAL / 物理 redo ログ)
+
+> このセクションは**設計(これから実装する)**。現状は未実装。
+> 目的は、`write-loop` + `sync` + 突然の電源断(`boot.sh` の `panic=-1`/QEMU 強制終了)
+> に対して、**再マウント後にファイルシステムのメタデータが常に一貫している**ことを保証すること。
+
+### 8.1 解決したい問題(なぜ必要か)
+
+現状、1つの高レベル操作(例: `touch` = `llfs_create`)は**複数の独立したブロック書き込み**に
+分解され、それぞれが別個に `mark_buffer_dirty` → 任意のタイミングで writeback される:
+
+| 操作 | 触るメタデータブロック |
+|---|---|
+| `create` | inode bitmap(確保)+ itable(inode 直列化)+ dir データブロック(dirent 追加) |
+| 書き込み中のブロック割当(`iomap_begin`) | block bitmap(確保)+ itable(`block[]`/`blocks`/`size`) |
+| `write_inode` | itable |
+
+これらは**順序保証も原子性もない**。電源断が途中に入ると、例えば:
+- block bitmap では「使用中」なのに itable の `block[]` に未反映 → **リークブロック**
+- itable は block を指すのに bitmap が「空き」 → 同じブロックが**二重割当(クロスリンク)** → 破損
+- dirent は inode を指すのに itable の当該 inode が未書き込み → **ダングリング参照**
+
+ジャーナリングは、これら複数ブロック更新を**1つの原子的トランザクション(all-or-nothing)**にする。
+
+### 8.2 採用方式と方針
+
+- **物理ブロック単位の redo(やり直し)ログ** = ext3/jbd2 の "journaled" モードの簡略版。
+  - 「論理(操作)ログ」ではなく「変更後ブロックの丸ごとコピー」を記録する。**冪等**で実装が単純。
+- **メタデータのみジャーナルする**(data=writeback 相当)。ファイルデータはページキャッシュから
+  最終ブロックへ直接 writeback(現状の `writepages` 経路のまま)。
+  - 新規割当ブロックは `IOMAP_F_NEW` でゼロ初期化済みのため、データ未達で電源断しても
+    **露出するのはゼロであってゴミではない**。メタデータの一貫性が保たれれば FS は壊れない。
+  - 「最近書いたデータがロストし得る」点は許容(`fsync` のデータ順序保証は将来拡張、§8.9)。
+- **単一トランザクション・ジャーナル**(同時に有効なトランザクションは常に1つ)。
+  LLFS は単一スレッド前提なので循環ログ(wraparound)は不要。コミット完了→チェックポイント→
+  ジャーナルクリア、を毎回行い、ジャーナルは「空 or 1件」の状態しか取らない。
+
+#### なぜこの方式が LLFS に合うか
+LLFS のメタデータ更新は**すべて `sb_bread` で得た buffer_head 経由**であり、FS 自身が全変更点を
+握っている。よって「`mark_buffer_dirty` を即時に呼ばず、commit まで in-place 書き込みを遅延する」
+という規律を**自前で**徹底でき、jbd2 のような複雑なバッファ状態機械なしに WAL 不変条件を守れる(§8.6)。
+
+### 8.3 オンディスク・レイアウトの変更
+
+スーパーブロックに journal 領域の位置・長さを追加(レイアウトはスーパーブロックが正、の原則を踏襲):
+
+```c
+struct llfs_super_block {       // 現行 22B → +8B = 30B(64B 境界内)
+    __le32 magic;
+    __le32 block_size;
+    __le32 itable_block;
+    __le32 inode_bitmap_block;
+    __le32 block_bitmap_block;
+    __le16 inode_size;
+    __le16 pad;                 // 4B 境界調整(新規)
+    __le32 journal_block;       // ジャーナル領域の先頭ブロック番号(新規)
+    __le32 journal_blocks;      // ジャーナル領域のブロック数(新規)
+};
+```
+
+`struct llfs_sb_info` にも `u32 journal_block; u32 journal_blocks;` を追加し、`fill_super` で変換取り込み。
+
+**新レイアウト(`mkfs.py` を更新)**:
+
+| ブロック番号 | 内容 |
+|---|---|
+| 0 | 予約 |
+| 1 | スーパーブロック |
+| 2 | inode テーブル |
+| 3 | inode ビットマップ |
+| 4 | ブロックビットマップ |
+| **5 〜 5+J−1** | **ジャーナル領域(J ブロック)** ← 新規 |
+| 5+J | ルートディレクトリのデータブロック |
+| 6+J〜 | 空きデータブロック |
+
+- ジャーナル長 `J` は当面 **32 ブロック(128 KiB)**。1トランザクションが触るメタは最大でも
+  数ブロック(create で 3)なので十分。
+- `mkfs.py` は **block bitmap でブロック 0〜(5+J) を使用済み**にマーク(ジャーナル領域を
+  アロケータに渡さないため)。`journal_block=5` / `journal_blocks=J` を SB に書く。
+  ジャーナル領域は**ゼロ初期化**(descriptor magic=0 = 空)。
+
+### 8.4 ジャーナルのオンディスク形式
+
+ジャーナル領域内は **[descriptor] [data 0] … [data n−1] [commit]** の連続レイアウト
+(先頭 = `journal_block`)。
+
+```c
+#define LLFS_JRNL_DESC_MAGIC   0x4c4c4a44u  // "LLJD" descriptor
+#define LLFS_JRNL_COMMIT_MAGIC 0x4c4c4a43u  // "LLJC" commit
+
+/* descriptor ブロック(journal_block に置く): このトランザクションの内容目録 */
+struct llfs_jrnl_desc {
+    __le32 magic;        // LLFS_JRNL_DESC_MAGIC(0 ならジャーナルは空)
+    __le32 sequence;     // トランザクション連番(commit と一致して初めて有効)
+    __le32 n_blocks;     // 後続する data ブロック数
+    __le32 target[];     // 各 data ブロックの最終(in-place)ブロック番号、n_blocks 個
+};
+
+/* commit ブロック(data の直後 = journal_block + 1 + n_blocks に置く) */
+struct llfs_jrnl_commit {
+    __le32 magic;        // LLFS_JRNL_COMMIT_MAGIC
+    __le32 sequence;     // descriptor.sequence と一致 = コミット成立の証拠
+};
+```
+
+- **コミット成立の判定**: descriptor.magic 有効 **かつ** commit ブロックの magic 有効 **かつ**
+  両者の `sequence` 一致。トーン(torn write)した commit はマジック/連番不一致で弾かれる。
+- descriptor は 1 ブロックで `target[]` を最大 (4096−12)/4 ≈ 1020 個保持でき、`J=32` の
+  data 上限(30)に対し十分。
+
+### 8.5 トランザクションのコミット手順(WAL プロトコル)
+
+メタ更新は**まずジャーナルに書いて永続化してから**、最終位置に書く。バリア(デバイスフラッシュ)の
+位置が肝。インメモリのトランザクション:
+
+```c
+#define LLFS_TXN_MAX 30
+struct llfs_txn {
+    struct super_block *sb;
+    unsigned int n;                          // ステージ済みブロック数
+    unsigned int target[LLFS_TXN_MAX];       // 最終ブロック番号
+    struct buffer_head *bh[LLFS_TXN_MAX];    // in-place バッファ(変更済み・未 dirty・pin 中)
+};
+
+// 変更したメタ buffer_head を登録(mark_buffer_dirty の代わりに呼ぶ)
+void llfs_txn_log(struct llfs_txn *t, struct buffer_head *bh);
+```
+
+`llfs_txn_commit(t)` の手順(`blkdev_issue_flush` or REQ_PREFLUSH/FUA でバリア):
+
+```
+1. descriptor を組み立て(magic, ++sequence, n, target[0..n-1])、journal_block へ書く
+2. data 0..n-1 を journal_block+1.. へ書く(bh[i]->b_data を丸ごと)
+3. ── BARRIER ──  ここまで(descriptor+data)をディスクに確実に永続化(flush)
+4. commit ブロック(magic, 同 sequence)を journal_block+1+n へ書き、flush  ← ★コミット点
+5. チェックポイント: 各 bh[i] を mark_buffer_dirty + sync_dirty_buffer で最終位置へ反映、flush
+6. ジャーナルクリア: descriptor.magic=0 を書いて flush(次回マウントで replay されないように)
+7. 各 bh[i] を brelse(pin 解除)、txn を解放
+```
+
+クラッシュ時の帰結:
+- **手順4より前**で停止 → commit 無効 → リカバリは無視。in-place はまだ手付かず(=旧状態で一貫)。
+- **手順4成立後〜手順6前**で停止 → リカバリが replay → 全 in-place を再現(=新状態で一貫)。
+- **手順6後**で停止 → ジャーナル空 → 何もしない。
+→ いずれも **all-or-nothing**。
+
+### 8.6 バッファキャッシュ制御の方針(最重要)
+
+WAL の不変条件は「**ジャーナル commit が永続化するまで、その操作のメタを最終位置へ書いてはならない**」。
+現状コードは更新後すぐ `mark_buffer_dirty` するため、カーネルの定期 writeback が commit 前に
+in-place へ書き出し得る。これを防ぐ規律:
+
+- メタデータ更新箇所では **`mark_buffer_dirty` を即時に呼ばない**。代わりに、
+  1. `sb_bread` で bh 取得 → b_data を変更
+  2. `get_bh(bh)` で pin したまま `llfs_txn_log(t, bh)` に登録(`brelse` しない)
+- in-place への実書き込みは**チェックポイント(手順5)で初めて** `mark_buffer_dirty` +
+  `sync_dirty_buffer` する。それまで dirty にしないのでカーネルが勝手に書き出さない。
+- 同一ブロック(例: itable)が同一トランザクションで複数回更新される場合は、bh は同一なので
+  **重複登録を避ける**(`target` 重複チェック、または既登録 bh はスキップ)。
+
+これにより、ext3/jbd2 のような専用バッファ状態管理を持ち込まずに不変条件を満たせる
+(LLFS が全メタ更新点を握っているからこそ可能)。
+
+### 8.7 リカバリ(マウント時 replay)
+
+`llfs_fill_super` で **スーパーブロック取り込み直後・root inode を読む前**に
+`llfs_journal_recover(sb)` を実行(itable/bitmap を信用する前に整合させる):
+
+```
+llfs_journal_recover(sb):
+  desc = read(journal_block)
+  if desc.magic != LLFS_JRNL_DESC_MAGIC: return        // ジャーナル空 → 何もしない
+  n = desc.n_blocks
+  commit = read(journal_block + 1 + n)
+  if commit.magic != LLFS_JRNL_COMMIT_MAGIC
+     || commit.sequence != desc.sequence:
+       // 未コミット(torn) → 破棄。desc.magic=0 を書いて flush
+       return
+  // コミット済み → redo
+  for i in 0..n-1:
+      copy journal_block+1+i のデータを desc.target[i] へ(sb_bread→memcpy→mark_buffer_dirty→sync)
+  flush
+  desc.magic = 0; write+flush                            // クリア(冪等だが二度手間を避ける)
+```
+
+redo は**同一内容の上書き**なので冪等。replay 中に再度クラッシュしても、次回また replay すれば
+同じ結果に収束する。
+
+### 8.8 既存コードへの統合ポイント
+
+| 場所 | 現状 | 変更 |
+|---|---|---|
+| `llfs.h` | SB 構造体 | `pad`/`journal_block`/`journal_blocks` 追加、`llfs_jrnl_*` 構造体、`llfs_txn` API、magic 定義 |
+| `mkfs.py` | レイアウト | journal 領域を挿入、bbitmap に journal 範囲を使用済み計上、SB に journal フィールド書込 |
+| `super.c` `fill_super` | SB 取込 | journal フィールド取込 → **`llfs_journal_recover` 呼出**(root 読込の前) |
+| `inode.c` `llfs_get_first_free_inode` | `set_bit`+`mark_buffer_dirty`+`brelse` | bh を pin して `llfs_txn_log`(dirty/brelse しない) |
+| `iomap.c` `llfs_alloc_block` | 同上 | 同上(block bitmap を txn 経由に) |
+| `inode.c` `llfs_add_dirent` | dir bh を `mark_buffer_dirty`+`brelse` | `llfs_txn_log` 経由に |
+| `inode.c` `llfs_write_inode` | itable bh を `mark_buffer_dirty`+`brelse` | `llfs_txn_log` 経由に |
+| 操作の入口/出口 | — | トランザクション境界(`llfs_txn_begin`/`llfs_txn_commit`)を設ける(§8.10) |
+
+### 8.9 トランザクション境界(コミット契機)
+
+**Phase 1(推奨・最単純)**: **操作ごとの同期コミット**。
+`llfs_create` の入口で `txn_begin`、その操作が触る全メタ(bitmap/itable/dir)を `txn_log`、
+出口で `txn_commit`。書き込み割当系(`iomap_begin` の block 確保 + `write_inode`)は、
+`sync`(= `writepages`/`write_inode`/`sync_fs`)契機で動く現状経路を 1 トランザクションにまとめる。
+遅いが正しさが明快で、`write-loop`+`sync` のテストに最適。
+
+**Phase 2(将来)**: `->sync_fs` で**バッチコミット**(running transaction にメタを溜め、
+`sync_fs`/journal full/unmount でまとめて commit)。スループット向上。循環ログ化(§8.10)とセット。
+
+### 8.10 段階的実装計画
+
+- **Phase 0**: オンディスク形式追加(SB フィールド・`mkfs.py`・`llfs.h` 構造体)。journal は
+  ゼロ(空)。`llfs_journal_recover` は「空なら何もしない」だけ実装。既存動作に影響なし。
+- **Phase 1**: §8.5–8.6 の同期 redo ジャーナルを実装。メタ更新を全て `txn_log` 経由に。
+  `llfs_create` を 1 トランザクション化。
+- **Phase 2**: リカバリ replay(§8.7)を実装し、`write-loop` + 電源断 → 再マウントで
+  一貫性が保たれることを確認。
+- **Phase 3(任意)**: `sync_fs` バッチコミット、循環ログ(wraparound + head/tail を journal
+  superblock に永続化)、data=ordered(データを先に flush してからメタ commit)。
+
+### 8.11 クラッシュシナリオ検証(設計の自己検証)
+
+`llfs_create`(inode bitmap + itable + dir block の 3 ブロックを 1 txn)で電源断した場合:
+
+| 断点 | ジャーナル状態 | リカバリ動作 | 結果 |
+|---|---|---|---|
+| descriptor 書込中 | desc magic 不定/未完 | 無視 | 旧状態(ファイル未作成)で一貫 |
+| data 書込中 | commit 無し | 無視 | 同上 |
+| commit 書込中(torn) | seq 不一致 | 無視 | 同上 |
+| commit 成立後・checkpoint 前 | コミット済み | replay | 新状態(3ブロック全反映)で一貫 |
+| checkpoint 途中 | コミット済み | replay(冪等上書き) | 新状態で一貫(部分反映を補完) |
+| クリア後 | desc magic=0 | 無し | 新状態で一貫 |
+
+いずれも **bitmap・itable・dirent が互いに矛盾しない**(リーク/クロスリンク/ダングリング無し)。
+
+### 8.12 既知の制約・留意
+
+- **データはジャーナルしない**(§8.2)。`fsync` 後のデータ永続も厳密には保証しない(メタのみ)。
+  data=ordered は Phase 3。
+- **同期コミットは遅い**(Phase 1)。`write-loop` は毎回 `sync` するので顕著。正しさ優先の段階。
+- **flush の確実な発行**が前提。`sync_dirty_buffer` は I/O 完了待ちはするが、デバイスキャッシュの
+  フラッシュには `blkdev_issue_flush(sb->s_bdev)` を各バリア点で明示的に呼ぶこと(QEMU/実機の
+  ライトバックキャッシュ対策)。これを怠ると WAL 順序がデバイス内で崩れ得る。
+- 単一スレッド前提のロックレス実装。並行マウント操作は対象外。
+- §7 の「`blocks` カウント不統一」「`bno << SHIFT` の 32bit 演算」等の既存沼は本設計と直交。
+  ジャーナル化の前後で別途修正してよい。
