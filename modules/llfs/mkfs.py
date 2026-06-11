@@ -11,8 +11,11 @@ SB_BLOCK = 1  # スーパーブロック
 ITABLE_BLOCK = 2  # inode テーブル
 IBITMAP_BLOCK = 3  # inode ビットマップ
 BBITMAP_BLOCK = 4  # ブロックビットマップ
-ROOT_DATA_BLOCK = 5  # ルートディレクトリのデータブロック
-FIRST_FREE_BLOCK = 6  # 最初の空きブロック(これ以降がデータ領域)
+# --- [JOURNAL] SPEC §8.3: block bitmap の直後にジャーナル領域を挿入 ---
+JOURNAL_BLOCK = 5  # ジャーナル領域の先頭ブロック番号
+JOURNAL_BLOCKS = 32  # ジャーナル領域のブロック数(J = 32 = 128KiB)
+ROOT_DATA_BLOCK = JOURNAL_BLOCK + JOURNAL_BLOCKS  # ルートディレクトリのデータブロック(=37)
+FIRST_FREE_BLOCK = ROOT_DATA_BLOCK + 1  # 最初の空きブロック(これ以降がデータ領域, =38)
 
 ROOT_INO = 1  # inode 0 は予約。ルートは inode 1
 
@@ -34,17 +37,21 @@ def make_dirent(ino, name, ftype, rec_len):
 
 
 def write_super(f):
-    # struct llfs_super_block: __le32 x5 + __le16(inode_size)
+    # struct llfs_super_block:
+    #   __le32 x5 + __le16(inode_size) + __le16(pad) + __le32(journal_block) + __le32(journal_blocks)
     f.seek(BLOCK_SIZE * SB_BLOCK)
     f.write(
         struct.pack(
-            "<IIIIIH",
+            "<IIIIIHHII",
             MAGIC,
             BLOCK_SIZE,
             ITABLE_BLOCK,
             IBITMAP_BLOCK,
             BBITMAP_BLOCK,
             INODE_SIZE,
+            0,  # pad(4B 境界調整)
+            JOURNAL_BLOCK,  # [JOURNAL] ジャーナル領域の先頭ブロック番号
+            JOURNAL_BLOCKS,  # [JOURNAL] ジャーナル領域のブロック数
         )
     )
 
@@ -96,6 +103,7 @@ def main():
         # inode ビットマップ: inode 0(予約)と 1(ルート)を使用済みに
         set_bits(f, IBITMAP_BLOCK, 2)
         # ブロックビットマップ: block 0..ROOT_DATA_BLOCK を使用済みに
+        # ([JOURNAL] ジャーナル領域 5..36 もこの範囲に含まれ、アロケータに渡らない)
         set_bits(f, BBITMAP_BLOCK, ROOT_DATA_BLOCK + 1)
         # 少なくとも最初の空きブロックの手前までイメージを確保
         f.seek(0, 2)

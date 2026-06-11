@@ -16,16 +16,23 @@ static unsigned int llfs_get_first_free_inode(struct super_block *sb) {
 
     long unsigned int *bitmap = (long unsigned int *)bh->b_data;
 
-    /* find_first_zero_bit の第2引数はビット数。block_size はバイト数なので 8 倍する */
-    unsigned int res = find_first_zero_bit(bitmap, sbi->block_size * 8);
-    if (res == 0 || res >= LLFS_BLOCK_SIZE << 3) {
-        pr_warn("unsound ino\n");
+    /* inode テーブルは 1 ブロックに収まる前提なので、確保できる inode 数は
+     * block_size / inode_size(= 4096/64 = 64)で頭打ち。inode bitmap は 32768 ビット
+     * あるが、その上限を超える ino を返すと write_inode が itable ブロック外
+     * (= 隣接する bitmap ブロック)へ書き込み、メタデータを破壊してしまう。
+     * したがって探索範囲・判定ともに max_inodes で制限する。 */
+    unsigned int max_inodes = sbi->block_size / sbi->inode_size;
+    unsigned int res = find_first_zero_bit(bitmap, max_inodes);
+    if (res == 0 || res >= max_inodes) {
+        pr_warn("llfs: inode table full (max %u)\n", max_inodes);
+        brelse(bh);
         return 0;
     }
     set_bit(res, bitmap);
-    mark_buffer_dirty(bh);
-
-    brelse(bh);
+    /* [JOURNAL] 旧: mark_buffer_dirty(bh); brelse(bh);
+     * 変更したメタ(inode bitmap)を即時反映せず、トランザクションに登録する。
+     * bh は brelse せずに所有権を txn へ渡す。 */
+    llfs_txn_log(sb, bh);
 
     pr_info(KERN_INFO "first free node: %d\n", res);
 
@@ -133,8 +140,9 @@ static int llfs_add_dirent(struct inode *dir, struct dentry *dentry, struct inod
     dirent->rec_len = cpu_to_le16(((name_len >> 2) << 2) + 4 + 8);
     memcpy(dirent->name, dentry->d_name.name, name_len);
 
-    mark_buffer_dirty(bh);
-    brelse(bh);
+    /* [JOURNAL] 旧: mark_buffer_dirty(bh); brelse(bh);
+     * ディレクトリデータ(dirent)の変更をトランザクションへ登録(brelse しない)。 */
+    llfs_txn_log(dir->i_sb, bh);
 
     return 0;
 }
@@ -149,17 +157,30 @@ static void llfs_evict_inode(struct inode *inode) {
 }
 
 static int llfs_write_inode(struct inode *inode, struct writeback_control *wbc) {
+    struct llfs_sb_info *sbi = llfs_get_sb_info(inode->i_sb);
     pr_info("llfs write inode: %lu\n", inode->i_ino);
-    
+
     struct buffer_head *bh;
-    struct llfs_itable *itable = llfs_get_itable(inode->i_sb, &bh);
-    if (IS_ERR(itable))
+    struct llfs_inode *dinode;
+    struct llfs_inode_info *inodei;
+    struct llfs_itable *itable;
+
+    /* [JOURNAL] itable の読み出し〜直列化〜txn 登録を、iomap_begin の確保区間や
+     * commit と相互排他にする。これがないと flusher の write_inode が確保途中の
+     * block[] を直列化し、bitmap と itable が食い違ってしまう。 */
+    mutex_lock(&sbi->lock);
+
+    itable = llfs_get_itable(inode->i_sb, &bh);
+    if (IS_ERR(itable)) {
+        mutex_unlock(&sbi->lock);
         return -EIO;
-    
-    struct llfs_inode *dinode = &itable->table[inode->i_ino];
-    struct llfs_inode_info *inodei = llfs_get_inode_info_checked(inode);
+    }
+
+    dinode = &itable->table[inode->i_ino];
+    inodei = llfs_get_inode_info_checked(inode);
     if (IS_ERR(inodei)) {
         brelse(bh);
+        mutex_unlock(&sbi->lock);
         return PTR_ERR(inodei);
     }
 
@@ -169,15 +190,26 @@ static int llfs_write_inode(struct inode *inode, struct writeback_control *wbc) 
     dinode->blocks = cpu_to_le32(inode->i_blocks);
     memcpy(dinode->block, inodei->block, sizeof(dinode->block));
 
-    mark_buffer_dirty(bh);
-    brelse(bh);
+    /* [JOURNAL] 旧: mark_buffer_dirty(bh); brelse(bh);
+     * itable の変更をトランザクションへ登録(同一ブロックは txn 側で重複排除)。 */
+    llfs_txn_log(inode->i_sb, bh);
+    mutex_unlock(&sbi->lock);
     return 0;
+}
+
+/* [JOURNAL] sync(2)/sync_fs 契機で、溜まったメタ更新を1トランザクションとして
+ * 原子的にコミットする。sync() は writeback(writepages/write_inode で txn_log)→
+ * sync_fs の順で動くため、その操作群が1つの atomic な単位として永続化される。 */
+static int llfs_sync_fs(struct super_block *sb, int wait) {
+    pr_info("llfs sync_fs (wait=%d)\n", wait);
+    return llfs_txn_commit(sb);
 }
 
 const struct super_operations llfs_sop = {
     .statfs = simple_statfs,
     .evict_inode = llfs_evict_inode,
     .write_inode = llfs_write_inode,
+    .sync_fs = llfs_sync_fs,
 };
 
 const struct inode_operations llfs_dir_iop = {
@@ -206,8 +238,10 @@ struct inode *llfs_make_inode(struct super_block *sb, umode_t mode, void *data) 
         return ERR_PTR(-ENOMEM);
 
     unsigned int ino = llfs_get_first_free_inode(sb);
-    if (!ino)
-        return ERR_PTR(-EIO);
+    if (!ino) {
+        iput(inode); /* new_inode で確保した VFS inode を解放(リーク防止) */
+        return ERR_PTR(-ENOSPC);
+    }
 
     inode->i_ino = ino;
     inode->i_private = data;
@@ -235,22 +269,41 @@ struct inode *llfs_make_inode(struct super_block *sb, umode_t mode, void *data) 
 
 int llfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode,
                 bool excl) {
+    struct llfs_sb_info *sbi = llfs_get_sb_info(dir->i_sb);
+    struct inode *inode;
+    int err;
+
     printk("creating a file: %pks", (void *)dentry->d_name.name);
 
-    struct inode *inode = llfs_make_inode(dir->i_sb, mode, (void *)NULL);
+    /* [JOURNAL] inode bitmap 確保 + dirent 追加 + itable 直列化(後続の write_inode)が
+     * 1 トランザクションに収まるよう、メタ更新区間を lock で直列化する。
+     * commit(sync_fs)も同じ lock を取るため、確保途中の状態がコミットされない。 */
+    mutex_lock(&sbi->lock);
 
-    if (!inode)
-        return -ENOMEM;
+    inode = llfs_make_inode(dir->i_sb, mode, (void *)NULL);
+    if (IS_ERR(inode)) { /* 旧: if(!inode) は ERR_PTR を素通しする誤り */
+        mutex_unlock(&sbi->lock);
+        return PTR_ERR(inode);
+    }
 
     inode_init_owner(idmap, inode, dir, mode);
 
     // dirに登録
-    llfs_add_dirent(dir, dentry, inode);
-
-    d_instantiate(dentry, inode);
+    err = llfs_add_dirent(dir, dentry, inode);
+    if (err) {
+        /* dirent を書けなければ inode を作っても参照できない。確保した inode を捨てる。
+         * (inode bitmap のビットは未コミットの txn 内なので brelse 時に in-place 未反映) */
+        mutex_unlock(&sbi->lock);
+        iput(inode);
+        return err;
+    }
 
     mark_inode_dirty(dir);
     mark_inode_dirty(inode);
+
+    mutex_unlock(&sbi->lock);
+
+    d_instantiate(dentry, inode);
 
     return 0;
 }

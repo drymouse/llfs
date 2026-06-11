@@ -1,5 +1,5 @@
 obj-m += llfs.o
-llfs-y += super.o inode.o iomap.o
+llfs-y += super.o inode.o iomap.o journal.o
 
 all:
 	make -C /home/mouse/Documents/is/lab3/sngw/fs-test/linux-7.0.10 M=$(PWD) modules

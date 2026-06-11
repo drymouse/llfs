@@ -29,8 +29,9 @@ MAX_INODES = BLOCK_SIZE // INODE_SIZE  # 64
 
 DIRENT_HEADER = 8  # inode(4) + rec_len(2) + name_len(1) + file_type(1)
 
-# mkfs が常に使用済みにする固定領域(予約/SB/itable/2 bitmap/root-data = block 0..5)
-FIXED_USED_BLOCKS_MAX = 5  # block 0..5 を常に「使用済み」とみなす
+# mkfs が常に使用済みにする固定領域(予約/SB/itable/2 bitmap/journal/root-data)。
+# [JOURNAL] block 0..(journal_block + journal_blocks) を常に「使用済み」とみなす。
+# 具体値は parse_super が読んだ journal フィールドから算出する(下の main 参照)。
 
 
 def rd_block(img, n):
@@ -46,6 +47,8 @@ def parse_super(img):
     b = rd_block(img, SB_BLOCK)
     magic, block_size, itable, ibmap, bbmap = struct.unpack_from("<IIIII", b, 0)
     (inode_size,) = struct.unpack_from("<H", b, 20)
+    # [JOURNAL] offset 22: pad(2) / journal_block(4) / journal_blocks(4)
+    journal_block, journal_blocks = struct.unpack_from("<II", b, 24)
     return {
         "magic": magic,
         "block_size": block_size,
@@ -53,6 +56,8 @@ def parse_super(img):
         "inode_bitmap_block": ibmap,
         "block_bitmap_block": bbmap,
         "inode_size": inode_size,
+        "journal_block": journal_block,
+        "journal_blocks": journal_blocks,
     }
 
 
@@ -86,6 +91,13 @@ def main():
     itable = rd_block(img, sb["itable_block"])
     ibmap = rd_block(img, sb["inode_bitmap_block"])
     bbmap = rd_block(img, sb["block_bitmap_block"])
+
+    # [JOURNAL] 固定領域 = block 0..(journal_block + journal_blocks)。
+    # journal_blocks==0(旧レイアウト)なら従来どおり block 0..5 を固定とみなす。
+    if sb["journal_blocks"]:
+        fixed_used_max = sb["journal_block"] + sb["journal_blocks"]  # = root-data block
+    else:
+        fixed_used_max = 5
 
     problems = []
 
@@ -160,7 +172,7 @@ def main():
             )
 
     # bitmap が used なのに誰も参照していない(固定領域を除く) → リークブロック
-    for b in range(FIXED_USED_BLOCKS_MAX + 1, BLOCK_SIZE * 8):
+    for b in range(fixed_used_max + 1, BLOCK_SIZE * 8):
         if bit_set(bbmap, b) and b not in block_owner:
             problems.append(f"[LEAK] block {b} は bitmap used だが参照する inode 無し(リークブロック)")
 

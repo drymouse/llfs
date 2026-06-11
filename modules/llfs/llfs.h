@@ -2,6 +2,7 @@
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/iomap.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 
 #ifndef NULL
@@ -10,6 +11,8 @@
 
 #ifndef __LLFS
 #define __LLFS
+
+#include "journal.h" /* ジャーナリング(SPEC §8)。llfs_txn / llfs_jrnl_* 定義 */
 
 #define LLFS_N_BLOCKS 13
 #define LLFS_NAME_MAXLEN 255
@@ -33,6 +36,9 @@ struct llfs_super_block {
     __le32 inode_bitmap_block; // Block number of inode bitmap
     __le32 block_bitmap_block; // Block number of block bitmap
     __le16 inode_size;         // Inode size (64 in llfs)
+    __le16 pad;                // [JOURNAL] 4B 境界調整
+    __le32 journal_block;      // [JOURNAL] ジャーナル領域の先頭ブロック番号
+    __le32 journal_blocks;     // [JOURNAL] ジャーナル領域のブロック数(0 ならジャーナル無し)
 };
 
 struct llfs_sb_info {       // In-memory: ネイティブ(CPU)エンディアンで保持
@@ -42,6 +48,14 @@ struct llfs_sb_info {       // In-memory: ネイティブ(CPU)エンディアン
     u32 inode_bitmap_block; // Block number of inode bitmap
     u32 block_bitmap_block; // Block number of block bitmap
     u16 inode_size;         // Inode size (64 in llfs)
+    u32 journal_block;      // [JOURNAL] ジャーナル領域の先頭ブロック番号
+    u32 journal_blocks;     // [JOURNAL] ジャーナル領域のブロック数
+    u32 journal_seq;        // [JOURNAL] トランザクション連番(インメモリ)
+    struct llfs_txn *cur_txn; // [JOURNAL] 進行中トランザクション(単一)。無ければ NULL
+    struct mutex lock;      // [JOURNAL] 全メタデータ更新 + コミットを直列化する。
+                            // カーネル writeback(flusher)は SMP で並行動作するため、
+                            // 「bitmap 確保 + inode_info 更新 + itable 直列化 + commit」を
+                            // 不可分にして bitmap-only-commit によるリーク/破損を防ぐ。
 };
 
 struct llfs_inode {

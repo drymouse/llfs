@@ -30,6 +30,11 @@ static int llfs_init(struct fs_context *fc) {
 static void llfs_kill(struct super_block *sb) {
     pr_info("LLFS is unmounted!\n");
 
+    /* [JOURNAL] アンマウント直前に未コミットのトランザクションを永続化する。
+     * 通常は generic_shutdown_super 内の sync_fs で空になっているが安全弁。 */
+    if (sb->s_fs_info)
+        llfs_txn_commit(sb);
+
     kfree(sb->s_fs_info);
     sb->s_fs_info = NULL;
 
@@ -67,6 +72,12 @@ static int llfs_fill_super(struct super_block *sb, struct fs_context *fc) {
     sbi->inode_bitmap_block = le32_to_cpu(dsb->inode_bitmap_block);
     sbi->block_bitmap_block = le32_to_cpu(dsb->block_bitmap_block);
     sbi->inode_size         = le16_to_cpu(dsb->inode_size);
+    /* [JOURNAL] ジャーナル領域の位置・長さを取り込む(0 ならジャーナル無し) */
+    sbi->journal_block      = le32_to_cpu(dsb->journal_block);
+    sbi->journal_blocks     = le32_to_cpu(dsb->journal_blocks);
+    sbi->journal_seq        = 0;
+    sbi->cur_txn            = NULL;
+    mutex_init(&sbi->lock); /* [JOURNAL] メタ更新 + コミットの直列化用 */
 
     sb->s_fs_info = sbi;
     sb->s_magic   = sbi->magic;
@@ -76,11 +87,16 @@ static int llfs_fill_super(struct super_block *sb, struct fs_context *fc) {
     brelse(bh);
 
     pr_info(KERN_INFO "magic: 0x%08lx\n", sb->s_magic);
+    pr_info(KERN_INFO "journal: block=%u blocks=%u\n", sbi->journal_block, sbi->journal_blocks);
 
     if (sbi->block_size != LLFS_BLOCK_SIZE) {
         pr_info(KERN_INFO "unexpected block_size: %u\n", sbi->block_size);
         return -EINVAL;
     }
+
+    /* [JOURNAL] itable / bitmap を信用する前にジャーナルを replay して整合させる。
+     * 必ず root inode を読む前に行う(SPEC §8.7)。 */
+    llfs_journal_recover(sb);
 
     /* ルート inode は inode テーブルから読む(i_op/i_fop/a_ops/i_private は iget が設定) */
     root_inode = llfs_iget(sb, LLFS_ROOT_INODE);

@@ -27,6 +27,8 @@ const struct address_space_operations llfs_asops = {
     // .write_end = llfs_write_end,
 };
 
+/* 前提: 呼び出し側(llfs_iomap_begin)が sbi->lock を保持していること。
+ * 「bitmap 確保」と直後の「inodei->block[] 代入」を不可分にするためロックは外側で持つ。 */
 unsigned llfs_alloc_block(struct super_block *sb) {
     struct llfs_sb_info *sbi = llfs_get_sb_info(sb);
     unsigned bitmap_block = sbi->block_bitmap_block;
@@ -44,9 +46,10 @@ unsigned llfs_alloc_block(struct super_block *sb) {
         return 0;
     }
     set_bit(res, bitmap);
-    mark_buffer_dirty(bh);
-
-    brelse(bh);
+    /* [JOURNAL] 旧: mark_buffer_dirty(bh); brelse(bh);
+     * block bitmap の変更をトランザクションへ登録(brelse しない)。
+     * これにより「bitmap 確保」と「itable の block[] 更新」が同一 txn で原子化される。 */
+    llfs_txn_log(sb, bh);
 
     pr_info("first free block: %d\n", res);
 
@@ -65,6 +68,7 @@ static int llfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length, u
                             struct iomap *iomap, struct iomap *srcmap) {
     // pr_info("llfs iomap begin...\n");
 
+    struct llfs_sb_info *sbi = llfs_get_sb_info(inode->i_sb);
     struct llfs_inode_info *inodei = llfs_get_inode_info_checked(inode);
     if (IS_ERR(inodei)) {
         return -EIO;
@@ -75,14 +79,21 @@ static int llfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length, u
     if (sector >= LLFS_N_BLOCKS)
         return -EIO;
 
-    unsigned bno = inodei->block[sector];
     iomap->bdev = inode->i_sb->s_bdev;
     iomap->offset = offset;
     iomap->length = LLFS_BLOCK_SIZE;
 
+    /* [JOURNAL] 「bitmap 確保 + inodei->block[] 代入 + mark_inode_dirty」を不可分にする。
+     * これを欠くと、並行する write_inode(flusher)が代入前の block[]=0 を直列化し、
+     * bitmap だけ確保済みの itable がコミットされて再マウント後にリークブロックになる。
+     * commit(sync_fs)も同じ lock を取るので、bitmap-only のコミットは起こらない。 */
+    mutex_lock(&sbi->lock);
+    unsigned bno = inodei->block[sector];
+
     if (bno == 0) {
         // 割り当てされていない
         if (!(flags & IOMAP_WRITE)) {
+            mutex_unlock(&sbi->lock);
             // 穴として報告
             iomap->addr = IOMAP_NULL_ADDR;
             iomap->type = IOMAP_HOLE;
@@ -91,6 +102,7 @@ static int llfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length, u
         pr_info("llfs iomap begin: Let's allocate block!");
         bno = llfs_alloc_block(inode->i_sb);
         if (bno == 0) {
+            mutex_unlock(&sbi->lock);
             return -EIO;
         }
 
@@ -101,6 +113,7 @@ static int llfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length, u
         mark_inode_dirty(inode);
         iomap->flags |= IOMAP_F_NEW;
     }
+    mutex_unlock(&sbi->lock);
 
     iomap->addr = bno << LLFS_BLOCK_SIZE_SHIFT;
     iomap->type = IOMAP_MAPPED;
